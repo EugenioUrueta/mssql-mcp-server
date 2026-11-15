@@ -25,7 +25,7 @@ public class GetTableSchemaTool : IMcpToolHandler
     public McpToolDefinition Definition => new()
     {
         Name = "get_table_schema",
-        Description = "Retrieves comprehensive schema information for a table: columns, data types, nullability, identity, default values, primary keys, foreign keys, and indexes.",
+        Description = "Retrieves comprehensive schema information for one or more tables: columns, data types, nullability, identity, default values, primary keys, foreign keys, and indexes. Supports single table or batch mode, and compact format.",
         InputSchema = new
         {
             type = "object",
@@ -34,7 +34,18 @@ public class GetTableSchemaTool : IMcpToolHandler
                 table_name = new
                 {
                     type = "string",
-                    description = "Name of the table (e.g. 'Orders' or 'dbo.Orders')."
+                    description = "Name of the table (e.g. 'Orders' or 'dbo.Orders'). Supports comma-separated list."
+                },
+                table_names = new
+                {
+                    type = "array",
+                    items = new { type = "string" },
+                    description = "Optional list of table names to retrieve schemas for in a single batch."
+                },
+                compact = new
+                {
+                    type = "boolean",
+                    description = "Whether to return a compact summary schema (omitting verbose column attributes and raw index details). Default is false."
                 },
                 profile = new
                 {
@@ -45,9 +56,13 @@ public class GetTableSchemaTool : IMcpToolHandler
                 {
                     type = "string",
                     description = "Target database (optional, defaults to active database)."
+                },
+                indent = new
+                {
+                    type = "boolean",
+                    description = "Whether to format JSON with indentation. Default is false."
                 }
-            },
-            required = new[] { "table_name" }
+            }
         }
     };
 
@@ -55,45 +70,228 @@ public class GetTableSchemaTool : IMcpToolHandler
     {
         if (!arguments.HasValue || arguments.Value.ValueKind != JsonValueKind.Object)
         {
-            return McpToolCallResult.Error("Arguments object is required with a 'table_name' property.");
+            return McpToolCallResult.Error("Arguments object is required with 'table_name' or 'table_names' property.");
         }
 
-        if (!arguments.Value.TryGetProperty("table_name", out var tProp) || string.IsNullOrWhiteSpace(tProp.GetString()))
+        var tableList = new List<string>();
+
+        // 1. Check for 'table_names' array
+        if (arguments.Value.TryGetProperty("table_names", out var tNamesProp) && tNamesProp.ValueKind == JsonValueKind.Array)
         {
-            return McpToolCallResult.Error("The 'table_name' parameter is required.");
+            foreach (var elem in tNamesProp.EnumerateArray())
+            {
+                string? t = elem.GetString();
+                if (!string.IsNullOrWhiteSpace(t))
+                {
+                    tableList.Add(t.Trim());
+                }
+            }
         }
 
-        string rawTable = tProp.GetString()!.Trim();
-
-        // Validate table name against security guardrails
-        try
+        // 2. Check for 'table_name' string
+        if (arguments.Value.TryGetProperty("table_name", out var tProp) && !string.IsNullOrWhiteSpace(tProp.GetString()))
         {
-            _validator.ValidateTable(rawTable);
+            string raw = tProp.GetString()!.Trim();
+            var parts = raw.Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            foreach (var part in parts)
+            {
+                if (!tableList.Contains(part, StringComparer.OrdinalIgnoreCase))
+                {
+                    tableList.Add(part);
+                }
+            }
         }
-        catch (Exception ex)
+
+        if (tableList.Count == 0)
         {
-            return McpToolCallResult.Error($"Security guardrail blocked: {ex.Message}");
+            return McpToolCallResult.Error("Either 'table_name' or 'table_names' parameter is required.");
+        }
+
+        // Validate all tables against security guardrails
+        foreach (var rawTable in tableList)
+        {
+            try
+            {
+                _validator.ValidateTable(rawTable);
+            }
+            catch (Exception ex)
+            {
+                return McpToolCallResult.Error($"Security guardrail blocked: {ex.Message}");
+            }
+        }
+
+        bool compact = false;
+        if (arguments.Value.TryGetProperty("compact", out var cmpProp) &&
+            (cmpProp.ValueKind == JsonValueKind.True || cmpProp.ValueKind == JsonValueKind.False))
+        {
+            compact = cmpProp.GetBoolean();
+        }
+
+        bool indent = false;
+        if (arguments.Value.TryGetProperty("indent", out var indProp) &&
+            (indProp.ValueKind == JsonValueKind.True || indProp.ValueKind == JsonValueKind.False))
+        {
+            indent = indProp.GetBoolean();
         }
 
         string? profile = arguments.Value.TryGetProperty("profile", out var prProp) ? prProp.GetString() : null;
         string? database = arguments.Value.TryGetProperty("database", out var dbProp) ? dbProp.GetString() : null;
 
-        // Parse schema and table name
-        string schemaName = "dbo";
-        string tableName = rawTable.Replace("[", "").Replace("]", "");
-        if (tableName.Contains('.'))
-        {
-            var parts = tableName.Split('.', 2);
-            schemaName = parts[0];
-            tableName = parts[1];
-        }
-
         try
         {
             await using var connection = await _connectionManager.OpenConnectionAsync(profile, database, cancellationToken);
 
-            // 1. Columns query
-            const string columnsSql = @"
+            var tableResults = new List<object>();
+            foreach (var rawTable in tableList)
+            {
+                string schemaName = "dbo";
+                string tableName = rawTable.Replace("[", "").Replace("]", "");
+                if (tableName.Contains('.'))
+                {
+                    var parts = tableName.Split('.', 2);
+                    schemaName = parts[0];
+                    tableName = parts[1];
+                }
+
+                var (schemaObj, error) = await GetSingleTableSchemaAsync(connection, schemaName, tableName, compact, cancellationToken);
+                if (error != null)
+                {
+                    if (tableList.Count == 1)
+                    {
+                        return McpToolCallResult.Error(error);
+                    }
+                    // In batch mode, include the error in the list
+                    tableResults.Add(new { table = rawTable, error });
+                }
+                else if (schemaObj != null)
+                {
+                    tableResults.Add(schemaObj);
+                }
+            }
+
+            if (tableList.Count == 1 && tableResults.Count == 1 && !arguments.Value.TryGetProperty("table_names", out _))
+            {
+                // Single table backwards-compatible format
+                var single = tableResults[0];
+                var singleWithDb = new
+                {
+                    database = connection.Database,
+                    schema = ((dynamic)single).schema,
+                    table = ((dynamic)single).table,
+                    fullName = ((dynamic)single).fullName,
+                    primaryKey = ((dynamic)single).primaryKey,
+                    columns = ((dynamic)single).columns,
+                    foreignKeys = ((dynamic)single).foreignKeys,
+                    indexes = compact ? null : ((dynamic)single).indexes
+                };
+
+                return McpToolCallResult.Success(JsonSerializer.Serialize(singleWithDb, new JsonSerializerOptions { WriteIndented = indent }));
+            }
+
+            var batchResult = new
+            {
+                database = connection.Database,
+                tableCount = tableResults.Count,
+                compact,
+                tables = tableResults
+            };
+
+            return McpToolCallResult.Success(JsonSerializer.Serialize(batchResult, new JsonSerializerOptions { WriteIndented = indent }));
+        }
+        catch (Exception ex)
+        {
+            return McpToolCallResult.Error($"Error retrieving table schema: {ex.Message}");
+        }
+    }
+
+    private async Task<(object? TableResult, string? Error)> GetSingleTableSchemaAsync(
+        SqlConnection connection,
+        string schemaName,
+        string tableName,
+        bool compact,
+        CancellationToken cancellationToken)
+    {
+        // 1. Primary Key query
+        const string pkSql = @"
+SELECT 
+    i.name AS pk_name,
+    c.name AS column_name,
+    ic.key_ordinal
+FROM sys.indexes i
+INNER JOIN sys.index_columns ic ON i.object_id = ic.object_id AND i.index_id = ic.index_id
+INNER JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id
+INNER JOIN sys.tables t ON i.object_id = t.object_id
+INNER JOIN sys.schemas s ON t.schema_id = s.schema_id
+WHERE s.name = @SchemaName AND t.name = @TableName AND i.is_primary_key = 1
+ORDER BY ic.key_ordinal;";
+
+        await using var cmdPk = new SqlCommand(pkSql, connection);
+        cmdPk.Parameters.Add(new SqlParameter("@SchemaName", SqlDbType.NVarChar, 128) { Value = schemaName });
+        cmdPk.Parameters.Add(new SqlParameter("@TableName", SqlDbType.NVarChar, 128) { Value = tableName });
+
+        string? pkName = null;
+        var pkColumns = new List<string>();
+        await using (var reader = await cmdPk.ExecuteReaderAsync(cancellationToken))
+        {
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                pkName ??= reader.GetString(0);
+                pkColumns.Add(reader.GetString(1));
+            }
+        }
+
+        // 2. Foreign Keys query
+        const string fkSql = @"
+SELECT 
+    fk.name AS fk_name,
+    cp.name AS column_name,
+    OBJECT_SCHEMA_NAME(fk.referenced_object_id) AS ref_schema,
+    OBJECT_NAME(fk.referenced_object_id) AS ref_table,
+    cr.name AS ref_column
+FROM sys.foreign_keys fk
+INNER JOIN sys.foreign_key_columns fkc ON fk.object_id = fkc.constraint_object_id
+INNER JOIN sys.columns cp ON fkc.parent_object_id = cp.object_id AND fkc.parent_column_id = cp.column_id
+INNER JOIN sys.columns cr ON fkc.referenced_object_id = cr.object_id AND fkc.referenced_column_id = cr.column_id
+INNER JOIN sys.tables t ON fk.parent_object_id = t.object_id
+INNER JOIN sys.schemas s ON t.schema_id = s.schema_id
+WHERE s.name = @SchemaName AND t.name = @TableName;";
+
+        await using var cmdFk = new SqlCommand(fkSql, connection);
+        cmdFk.Parameters.Add(new SqlParameter("@SchemaName", SqlDbType.NVarChar, 128) { Value = schemaName });
+        cmdFk.Parameters.Add(new SqlParameter("@TableName", SqlDbType.NVarChar, 128) { Value = tableName });
+
+        var foreignKeys = new List<object>();
+        var fkColumnNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        await using (var reader = await cmdFk.ExecuteReaderAsync(cancellationToken))
+        {
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                string col = reader.GetString(1);
+                fkColumnNames.Add(col);
+                if (compact)
+                {
+                    foreignKeys.Add(new
+                    {
+                        name = reader.GetString(0),
+                        column = col,
+                        references = $"{reader.GetString(2)}.{reader.GetString(3)}.{reader.GetString(4)}"
+                    });
+                }
+                else
+                {
+                    foreignKeys.Add(new
+                    {
+                        name = reader.GetString(0),
+                        column = col,
+                        referencedTable = $"{reader.GetString(2)}.{reader.GetString(3)}",
+                        referencedColumn = reader.GetString(4)
+                    });
+                }
+            }
+        }
+
+        // 3. Columns query
+        const string columnsSql = @"
 SELECT 
     c.column_id,
     c.name AS column_name,
@@ -111,18 +309,35 @@ INNER JOIN sys.types tp ON c.user_type_id = tp.user_type_id
 WHERE s.name = @SchemaName AND t.name = @TableName
 ORDER BY c.column_id;";
 
-            await using var cmdCols = new SqlCommand(columnsSql, connection);
-            cmdCols.Parameters.Add(new SqlParameter("@SchemaName", SqlDbType.NVarChar, 128) { Value = schemaName });
-            cmdCols.Parameters.Add(new SqlParameter("@TableName", SqlDbType.NVarChar, 128) { Value = tableName });
+        await using var cmdCols = new SqlCommand(columnsSql, connection);
+        cmdCols.Parameters.Add(new SqlParameter("@SchemaName", SqlDbType.NVarChar, 128) { Value = schemaName });
+        cmdCols.Parameters.Add(new SqlParameter("@TableName", SqlDbType.NVarChar, 128) { Value = tableName });
 
-            var columns = new List<object>();
-            await using (var reader = await cmdCols.ExecuteReaderAsync(cancellationToken))
+        var columns = new List<object>();
+        await using (var reader = await cmdCols.ExecuteReaderAsync(cancellationToken))
+        {
+            while (await reader.ReadAsync(cancellationToken))
             {
-                while (await reader.ReadAsync(cancellationToken))
-                {
-                    string colName = reader.GetString(1);
-                    bool isRestricted = _validator.IsColumnDenied(colName);
+                string colName = reader.GetString(1);
+                bool isRestricted = _validator.IsColumnDenied(colName);
+                bool isPk = pkColumns.Contains(colName, StringComparer.OrdinalIgnoreCase);
+                bool isFk = fkColumnNames.Contains(colName);
 
+                if (compact)
+                {
+                    columns.Add(new
+                    {
+                        name = colName,
+                        type = reader.GetString(2),
+                        nullable = reader.GetBoolean(6),
+                        isPrimaryKey = isPk,
+                        isForeignKey = isFk,
+                        isIdentity = reader.GetBoolean(7),
+                        isRestricted
+                    });
+                }
+                else
+                {
                     columns.Add(new
                     {
                         columnId = reader.GetInt32(0),
@@ -138,77 +353,17 @@ ORDER BY c.column_id;";
                     });
                 }
             }
+        }
 
-            if (columns.Count == 0)
-            {
-                return McpToolCallResult.Error($"Table '{schemaName}.{tableName}' was not found in database '{connection.Database}'.");
-            }
+        if (columns.Count == 0)
+        {
+            return (null, $"Table '{schemaName}.{tableName}' was not found in database '{connection.Database}'.");
+        }
 
-            // 2. Primary Key query
-            const string pkSql = @"
-SELECT 
-    i.name AS pk_name,
-    c.name AS column_name,
-    ic.key_ordinal
-FROM sys.indexes i
-INNER JOIN sys.index_columns ic ON i.object_id = ic.object_id AND i.index_id = ic.index_id
-INNER JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id
-INNER JOIN sys.tables t ON i.object_id = t.object_id
-INNER JOIN sys.schemas s ON t.schema_id = s.schema_id
-WHERE s.name = @SchemaName AND t.name = @TableName AND i.is_primary_key = 1
-ORDER BY ic.key_ordinal;";
-
-            await using var cmdPk = new SqlCommand(pkSql, connection);
-            cmdPk.Parameters.Add(new SqlParameter("@SchemaName", SqlDbType.NVarChar, 128) { Value = schemaName });
-            cmdPk.Parameters.Add(new SqlParameter("@TableName", SqlDbType.NVarChar, 128) { Value = tableName });
-
-            string? pkName = null;
-            var pkColumns = new List<string>();
-            await using (var reader = await cmdPk.ExecuteReaderAsync(cancellationToken))
-            {
-                while (await reader.ReadAsync(cancellationToken))
-                {
-                    pkName ??= reader.GetString(0);
-                    pkColumns.Add(reader.GetString(1));
-                }
-            }
-
-            // 3. Foreign Keys query
-            const string fkSql = @"
-SELECT 
-    fk.name AS fk_name,
-    cp.name AS column_name,
-    OBJECT_SCHEMA_NAME(fk.referenced_object_id) AS ref_schema,
-    OBJECT_NAME(fk.referenced_object_id) AS ref_table,
-    cr.name AS ref_column
-FROM sys.foreign_keys fk
-INNER JOIN sys.foreign_key_columns fkc ON fk.object_id = fkc.constraint_object_id
-INNER JOIN sys.columns cp ON fkc.parent_object_id = cp.object_id AND fkc.parent_column_id = cp.column_id
-INNER JOIN sys.columns cr ON fkc.referenced_object_id = cr.object_id AND fkc.referenced_column_id = cr.column_id
-INNER JOIN sys.tables t ON fk.parent_object_id = t.object_id
-INNER JOIN sys.schemas s ON t.schema_id = s.schema_id
-WHERE s.name = @SchemaName AND t.name = @TableName;";
-
-            await using var cmdFk = new SqlCommand(fkSql, connection);
-            cmdFk.Parameters.Add(new SqlParameter("@SchemaName", SqlDbType.NVarChar, 128) { Value = schemaName });
-            cmdFk.Parameters.Add(new SqlParameter("@TableName", SqlDbType.NVarChar, 128) { Value = tableName });
-
-            var foreignKeys = new List<object>();
-            await using (var reader = await cmdFk.ExecuteReaderAsync(cancellationToken))
-            {
-                while (await reader.ReadAsync(cancellationToken))
-                {
-                    foreignKeys.Add(new
-                    {
-                        name = reader.GetString(0),
-                        column = reader.GetString(1),
-                        referencedTable = $"{reader.GetString(2)}.{reader.GetString(3)}",
-                        referencedColumn = reader.GetString(4)
-                    });
-                }
-            }
-
-            // 4. Indexes query
+        // 4. Indexes query
+        var indexes = new List<object>();
+        if (!compact)
+        {
             const string idxSql = @"
 SELECT 
     i.name AS index_name,
@@ -228,7 +383,6 @@ GROUP BY i.name, i.type_desc, i.is_unique, i.is_primary_key;";
             cmdIdx.Parameters.Add(new SqlParameter("@SchemaName", SqlDbType.NVarChar, 128) { Value = schemaName });
             cmdIdx.Parameters.Add(new SqlParameter("@TableName", SqlDbType.NVarChar, 128) { Value = tableName });
 
-            var indexes = new List<object>();
             await using (var reader = await cmdIdx.ExecuteReaderAsync(cancellationToken))
             {
                 while (await reader.ReadAsync(cancellationToken))
@@ -242,10 +396,20 @@ GROUP BY i.name, i.type_desc, i.is_unique, i.is_primary_key;";
                     });
                 }
             }
+        }
 
-            var result = new
+        object result = compact
+            ? new
             {
-                database = connection.Database,
+                schema = schemaName,
+                table = tableName,
+                fullName = $"{schemaName}.{tableName}",
+                primaryKey = pkName != null ? new { name = pkName, columns = pkColumns } : null,
+                columns,
+                foreignKeys
+            }
+            : new
+            {
                 schema = schemaName,
                 table = tableName,
                 fullName = $"{schemaName}.{tableName}",
@@ -255,11 +419,6 @@ GROUP BY i.name, i.type_desc, i.is_unique, i.is_primary_key;";
                 indexes
             };
 
-            return McpToolCallResult.Success(JsonSerializer.Serialize(result, new JsonSerializerOptions { WriteIndented = true }));
-        }
-        catch (Exception ex)
-        {
-            return McpToolCallResult.Error($"Error retrieving table schema: {ex.Message}");
-        }
+        return (result, null);
     }
 }

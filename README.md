@@ -79,11 +79,11 @@ mssql-mcp-server/
 | :--- | :--- | :--- |
 | `list_profiles_and_databases` | *(ninguno)* | Devuelve el perfil activo, base de datos activa, perfiles configurados con sus banderas (`isReadOnly`, `allowExecuteSp`, `allowedDatabases`) y restricciones globales. |
 | `switch_context` | `profile` *(opc)*, `database` *(opc)* | Cambia el perfil y/o la base de datos activa para la sesión tras validar los permisos contra guardrails. |
-| `search_objects` | `pattern` *(req)*, `object_type` *(opc: TABLE, VIEW, PROCEDURE, ALL)*, `profile`, `database` | Busca tablas, vistas o procedimientos almacenados mediante comodines o patrones LIKE en `sys.objects`. |
-| `get_table_schema` | `table_name` *(req)*, `profile`, `database` | Obtiene el esquema completo de una tabla: columnas, tipos de datos, nulabilidad, identidad, valores por defecto, claves primarias, claves foráneas e índices. |
+| `search_objects` | `pattern` *(opc)*, `patterns` *(opc)*, `object_type` *(opc: TABLE, VIEW, PROCEDURE, ALL)*, `include_row_count` *(opc, bool)*, `profile`, `database`, `indent` *(opc, bool)* | Busca tablas, vistas o procedimientos almacenados mediante comodines o listas de patrones LIKE (`OR`). Soporta conteo estimado de filas. |
+| `get_table_schema` | `table_name` *(opc)*, `table_names` *(opc, array)*, `compact` *(opc, bool)*, `profile`, `database`, `indent` *(opc, bool)* | Obtiene el esquema completo o compacto de una o múltiples tablas en lote: columnas, PKs, FKs e índices. |
 | `get_sp_definition` | `sp_name` *(req)*, `profile`, `database` | Retorna el código T-SQL original (`sys.sql_modules`) y los metadatos de los parámetros tipados (`sys.parameters`). |
 | `execute_sp` | `sp_name` *(req)*, `parameters` *(opc)*, `simulate` *(opc, default: false)*, `profile`, `database` | Invoca procedimientos almacenados fuertemente tipados. Soporta modo simulación (rollback automático en transacción). |
-| `read_query` | `query` *(req)*, `max_rows` *(opc)*, `timeout_seconds` *(opc)*, `profile`, `database` | Ejecuta consultas de lectura (`SELECT` / `WITH CTE`) con límite de filas y tiempo de espera, aplicando validación de seguridad contra mutaciones. |
+| `read_query` | `query` *(req)*, `format` *(opc: objects, compact)*, `indent` *(opc, bool)*, `max_rows` *(opc)*, `timeout_seconds` *(opc)*, `profile`, `database` | Ejecuta consultas de lectura (`SELECT` / `WITH CTE`) con límite de filas y tiempo de espera. Soporta formato tabular compacto y serialización plana sin indentar para optimización de tokens. |
 
 ---
 

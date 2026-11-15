@@ -61,6 +61,17 @@ public class ReadQueryTool : IMcpToolHandler
                 {
                     type = "string",
                     description = "Target database (optional, defaults to active database)."
+                },
+                format = new
+                {
+                    type = "string",
+                    description = "Output format: 'objects' (array of JSON objects per row, default) or 'compact' (array of row value arrays matching the columns array).",
+                    @enum = new[] { "objects", "compact" }
+                },
+                indent = new
+                {
+                    type = "boolean",
+                    description = "Whether to format JSON with indentation. Default is false to minimize token consumption."
                 }
             },
             required = new[] { "query" }
@@ -111,6 +122,23 @@ public class ReadQueryTool : IMcpToolHandler
         string? profile = arguments.Value.TryGetProperty("profile", out var prProp) ? prProp.GetString() : null;
         string? database = arguments.Value.TryGetProperty("database", out var dbProp) ? dbProp.GetString() : null;
 
+        string format = "objects";
+        if (arguments.Value.TryGetProperty("format", out var fmtProp) && !string.IsNullOrWhiteSpace(fmtProp.GetString()))
+        {
+            string requestedFormat = fmtProp.GetString()!.Trim().ToLowerInvariant();
+            if (requestedFormat == "compact")
+            {
+                format = "compact";
+            }
+        }
+
+        bool indent = false;
+        if (arguments.Value.TryGetProperty("indent", out var indProp) &&
+            (indProp.ValueKind == JsonValueKind.True || indProp.ValueKind == JsonValueKind.False))
+        {
+            indent = indProp.GetBoolean();
+        }
+
         try
         {
             await using var connection = await _connectionManager.OpenConnectionAsync(profile, database, cancellationToken);
@@ -119,7 +147,8 @@ public class ReadQueryTool : IMcpToolHandler
                 CommandTimeout = timeout
             };
 
-            var rows = new List<Dictionary<string, object?>>();
+            var objectRows = new List<Dictionary<string, object?>>();
+            var compactRows = new List<List<object?>>();
             var columnNames = new List<string>();
             bool truncated = false;
 
@@ -130,42 +159,69 @@ public class ReadQueryTool : IMcpToolHandler
                     columnNames.Add(reader.GetName(i));
                 }
 
+                int rowCount = 0;
                 while (await reader.ReadAsync(cancellationToken))
                 {
-                    if (rows.Count >= maxRows)
+                    if (rowCount >= maxRows)
                     {
                         truncated = true;
                         break;
                     }
 
-                    var row = new Dictionary<string, object?>();
-                    for (int i = 0; i < reader.FieldCount; i++)
+                    if (format == "compact")
                     {
-                        string colName = columnNames[i];
-                        if (_validator.IsColumnDenied(colName))
+                        var rowList = new List<object?>(reader.FieldCount);
+                        for (int i = 0; i < reader.FieldCount; i++)
                         {
-                            row[colName] = "***RESTRICTED***";
+                            string colName = columnNames[i];
+                            if (_validator.IsColumnDenied(colName))
+                            {
+                                rowList.Add("***RESTRICTED***");
+                            }
+                            else
+                            {
+                                rowList.Add(reader.IsDBNull(i) ? null : reader.GetValue(i));
+                            }
                         }
-                        else
-                        {
-                            row[colName] = reader.IsDBNull(i) ? null : reader.GetValue(i);
-                        }
+                        compactRows.Add(rowList);
                     }
-                    rows.Add(row);
+                    else
+                    {
+                        var rowDict = new Dictionary<string, object?>(reader.FieldCount);
+                        for (int i = 0; i < reader.FieldCount; i++)
+                        {
+                            string colName = columnNames[i];
+                            if (_validator.IsColumnDenied(colName))
+                            {
+                                rowDict[colName] = "***RESTRICTED***";
+                            }
+                            else
+                            {
+                                rowDict[colName] = reader.IsDBNull(i) ? null : reader.GetValue(i);
+                            }
+                        }
+                        objectRows.Add(rowDict);
+                    }
+
+                    rowCount++;
                 }
             }
+
+            int finalRowCount = format == "compact" ? compactRows.Count : objectRows.Count;
+            object dataPayload = format == "compact" ? compactRows : objectRows;
 
             var result = new
             {
                 database = connection.Database,
-                rowCount = rows.Count,
+                format,
+                rowCount = finalRowCount,
                 maxRowsEnforced = maxRows,
                 isTruncated = truncated,
                 columns = columnNames,
-                data = rows
+                data = dataPayload
             };
 
-            return McpToolCallResult.Success(JsonSerializer.Serialize(result, new JsonSerializerOptions { WriteIndented = true }));
+            return McpToolCallResult.Success(JsonSerializer.Serialize(result, new JsonSerializerOptions { WriteIndented = indent }));
         }
         catch (Exception ex)
         {
