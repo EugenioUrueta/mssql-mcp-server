@@ -27,7 +27,7 @@ public class GetTableSchemaTool : IMcpToolHandler
     public McpToolDefinition Definition => new()
     {
         Name = "get_table_schema",
-        Description = "Retrieves comprehensive schema information for one or more tables: columns, data types, nullability, identity, default values, primary keys, foreign keys, and indexes. Supports single table or batch mode, and compact format.",
+        Description = "Retrieves comprehensive schema information for one or more tables: columns, data types, nullability, identity, default values, primary keys, foreign keys, and indexes. Supports single table or batch mode, compact format, and aliases 'table', 'name', 'tables', 'names'.",
         InputSchema = new
         {
             type = "object",
@@ -36,13 +36,35 @@ public class GetTableSchemaTool : IMcpToolHandler
                 table_name = new
                 {
                     type = "string",
-                    description = "Name of the table (e.g. 'Orders' or 'dbo.Orders'). Supports comma-separated list."
+                    description = "Name of the table (e.g. 'Orders' or 'dbo.Orders'). Supports comma-separated list. Aliases: 'table', 'name'."
                 },
                 table_names = new
                 {
                     type = "array",
                     items = new { type = "string" },
-                    description = "Optional list of table names to retrieve schemas for in a single batch."
+                    description = "Optional list of table names to retrieve schemas for in a single batch. Aliases: 'tables', 'names'."
+                },
+                table = new
+                {
+                    type = "string",
+                    description = "Alias for table_name."
+                },
+                name = new
+                {
+                    type = "string",
+                    description = "Alias for table_name."
+                },
+                tables = new
+                {
+                    type = "array",
+                    items = new { type = "string" },
+                    description = "Alias for table_names."
+                },
+                names = new
+                {
+                    type = "array",
+                    items = new { type = "string" },
+                    description = "Alias for table_names."
                 },
                 compact = new
                 {
@@ -82,30 +104,54 @@ public class GetTableSchemaTool : IMcpToolHandler
 
         var tableList = new List<string>();
 
-        // 1. Check for 'table_names' array
-        if (arguments.Value.TryGetProperty("table_names", out var tNamesProp) && tNamesProp.ValueKind == JsonValueKind.Array)
+        void AddTable(string? raw)
         {
-            foreach (var elem in tNamesProp.EnumerateArray())
+            if (string.IsNullOrWhiteSpace(raw)) return;
+            var parts = raw.Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            foreach (var part in parts)
             {
-                string? t = elem.GetString();
-                if (!string.IsNullOrWhiteSpace(t))
+                if (!string.IsNullOrWhiteSpace(part) && !tableList.Contains(part, StringComparer.OrdinalIgnoreCase))
                 {
-                    tableList.Add(t.Trim());
+                    tableList.Add(part);
                 }
             }
         }
 
-        // 2. Check for 'table_name' string
-        if (arguments.Value.TryGetProperty("table_name", out var tProp) && !string.IsNullOrWhiteSpace(tProp.GetString()))
+        void ProcessTableProperty(JsonElement elem)
         {
-            string raw = tProp.GetString()!.Trim();
-            var parts = raw.Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-            foreach (var part in parts)
+            if (elem.ValueKind == JsonValueKind.Array)
             {
-                if (!tableList.Contains(part, StringComparer.OrdinalIgnoreCase))
+                foreach (var item in elem.EnumerateArray())
                 {
-                    tableList.Add(part);
+                    if (item.ValueKind == JsonValueKind.String)
+                    {
+                        AddTable(item.GetString());
+                    }
                 }
+            }
+            else if (elem.ValueKind == JsonValueKind.String)
+            {
+                AddTable(elem.GetString());
+            }
+        }
+
+        // 1. Check batch aliases
+        string[] batchAliases = { "table_names", "tables", "names" };
+        foreach (var alias in batchAliases)
+        {
+            if (arguments.Value.TryGetProperty(alias, out var bProp))
+            {
+                ProcessTableProperty(bProp);
+            }
+        }
+
+        // 2. Check single aliases
+        string[] singleAliases = { "table_name", "table", "name" };
+        foreach (var alias in singleAliases)
+        {
+            if (arguments.Value.TryGetProperty(alias, out var sProp))
+            {
+                ProcessTableProperty(sProp);
             }
         }
 
@@ -183,7 +229,11 @@ public class GetTableSchemaTool : IMcpToolHandler
                 }
             }
 
-            if (tableList.Count == 1 && tableResults.Count == 1 && !arguments.Value.TryGetProperty("table_names", out _))
+            bool isBatchRequest = arguments.Value.TryGetProperty("table_names", out _) ||
+                                  arguments.Value.TryGetProperty("tables", out _) ||
+                                  arguments.Value.TryGetProperty("names", out _);
+
+            if (tableList.Count == 1 && tableResults.Count == 1 && !isBatchRequest)
             {
                 // Single table backwards-compatible format
                 var single = tableResults[0];

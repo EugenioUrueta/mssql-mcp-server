@@ -25,7 +25,7 @@ public class SearchObjectsTool : IMcpToolHandler
     public McpToolDefinition Definition => new()
     {
         Name = "search_objects",
-        Description = "Searches for database objects (tables, views, stored procedures) matching a pattern or list of patterns in the active or specified database.",
+        Description = "Searches for database objects (tables, views, stored procedures, functions) matching a pattern or list of patterns in the active or specified database. Supports aliases 'search', 'query', 'object_types', 'types', 'type'.",
         InputSchema = new
         {
             type = "object",
@@ -34,7 +34,7 @@ public class SearchObjectsTool : IMcpToolHandler
                 pattern = new
                 {
                     type = "string",
-                    description = "Search pattern (e.g. '%orders%', 'inv_%', 'Customers'). Supports comma/pipe separation for multiple patterns."
+                    description = "Search pattern (e.g. '%orders%', 'inv_%', 'Customers'). Supports comma/pipe separation for multiple patterns. Aliases: 'search', 'query'."
                 },
                 patterns = new
                 {
@@ -42,11 +42,38 @@ public class SearchObjectsTool : IMcpToolHandler
                     items = new { type = "string" },
                     description = "Optional list of multiple search patterns to match (OR logic)."
                 },
+                search = new
+                {
+                    type = "string",
+                    description = "Alias for pattern."
+                },
+                query = new
+                {
+                    type = "string",
+                    description = "Alias for pattern."
+                },
                 object_type = new
                 {
                     type = "string",
-                    description = "Type of object to filter: 'TABLE', 'VIEW', 'PROCEDURE', or 'ALL' (default 'ALL').",
-                    @enum = new[] { "TABLE", "VIEW", "PROCEDURE", "ALL" }
+                    description = "Type of object to filter: 'TABLE', 'VIEW', 'PROCEDURE', 'FUNCTION', or 'ALL' (default 'ALL'). Alias: 'type'. Accepts abbreviations (e.g. 'P', 'U', 'V', 'FN').",
+                    @enum = new[] { "TABLE", "VIEW", "PROCEDURE", "FUNCTION", "ALL" }
+                },
+                object_types = new
+                {
+                    type = "array",
+                    items = new { type = "string" },
+                    description = "Optional list of object types to filter (e.g. ['TABLE', 'PROCEDURE'] or ['U', 'P']). Alias: 'types'."
+                },
+                type = new
+                {
+                    type = "string",
+                    description = "Alias for object_type."
+                },
+                types = new
+                {
+                    type = "array",
+                    items = new { type = "string" },
+                    description = "Alias for object_types."
                 },
                 include_row_count = new
                 {
@@ -81,27 +108,51 @@ public class SearchObjectsTool : IMcpToolHandler
 
         var patternList = new List<string>();
 
-        // 1. Check for 'patterns' array
-        if (arguments.Value.TryGetProperty("patterns", out var patsProp) && patsProp.ValueKind == JsonValueKind.Array)
+        void AddPatterns(string? raw)
         {
-            foreach (var elem in patsProp.EnumerateArray())
+            if (string.IsNullOrWhiteSpace(raw)) return;
+            var parts = raw.Split(new[] { ',', '|' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            foreach (var part in parts)
             {
-                string? p = elem.GetString();
-                if (!string.IsNullOrWhiteSpace(p))
+                string norm = NormalizePattern(part);
+                if (!patternList.Contains(norm, StringComparer.OrdinalIgnoreCase))
                 {
-                    patternList.Add(NormalizePattern(p.Trim()));
+                    patternList.Add(norm);
                 }
             }
         }
 
-        // 2. Check for 'pattern' string (may be comma/pipe separated)
-        if (arguments.Value.TryGetProperty("pattern", out var pProp) && !string.IsNullOrWhiteSpace(pProp.GetString()))
+        void ProcessPatternProperty(JsonElement elem)
         {
-            string raw = pProp.GetString()!.Trim();
-            var parts = raw.Split(new[] { ',', '|' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-            foreach (var part in parts)
+            if (elem.ValueKind == JsonValueKind.Array)
             {
-                patternList.Add(NormalizePattern(part));
+                foreach (var item in elem.EnumerateArray())
+                {
+                    if (item.ValueKind == JsonValueKind.String)
+                    {
+                        AddPatterns(item.GetString());
+                    }
+                }
+            }
+            else if (elem.ValueKind == JsonValueKind.String)
+            {
+                AddPatterns(elem.GetString());
+            }
+        }
+
+        // Check for 'patterns' array/string
+        if (arguments.Value.TryGetProperty("patterns", out var patsProp))
+        {
+            ProcessPatternProperty(patsProp);
+        }
+
+        // Check for 'pattern', 'search', 'query' aliases
+        string[] patternAliases = { "pattern", "search", "query" };
+        foreach (var alias in patternAliases)
+        {
+            if (arguments.Value.TryGetProperty(alias, out var pProp))
+            {
+                ProcessPatternProperty(pProp);
             }
         }
 
@@ -110,10 +161,57 @@ public class SearchObjectsTool : IMcpToolHandler
             return McpToolCallResult.Error("Either 'pattern' or 'patterns' parameter is required.");
         }
 
-        string objectType = "ALL";
-        if (arguments.Value.TryGetProperty("object_type", out var otProp) && !string.IsNullOrWhiteSpace(otProp.GetString()))
+        // Parse object types
+        var rawTypes = new List<string>();
+
+        void AddRawTypes(string? raw)
         {
-            objectType = otProp.GetString()!.Trim().ToUpperInvariant();
+            if (string.IsNullOrWhiteSpace(raw)) return;
+            var parts = raw.Split(new[] { ',', '|' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            foreach (var part in parts)
+            {
+                if (!string.IsNullOrWhiteSpace(part))
+                {
+                    rawTypes.Add(part.Trim());
+                }
+            }
+        }
+
+        void ProcessTypeProperty(JsonElement elem)
+        {
+            if (elem.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var item in elem.EnumerateArray())
+                {
+                    if (item.ValueKind == JsonValueKind.String)
+                    {
+                        AddRawTypes(item.GetString());
+                    }
+                }
+            }
+            else if (elem.ValueKind == JsonValueKind.String)
+            {
+                AddRawTypes(elem.GetString());
+            }
+        }
+
+        string[] typeAliases = { "object_types", "types", "object_type", "type" };
+        foreach (var alias in typeAliases)
+        {
+            if (arguments.Value.TryGetProperty(alias, out var tProp))
+            {
+                ProcessTypeProperty(tProp);
+            }
+        }
+
+        var canonicalTypes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var raw in rawTypes)
+        {
+            string? norm = NormalizeObjectType(raw);
+            if (!string.IsNullOrEmpty(norm))
+            {
+                canonicalTypes.Add(norm);
+            }
         }
 
         bool includeRowCount = false;
@@ -145,6 +243,8 @@ public class SearchObjectsTool : IMcpToolHandler
             }
             string patternClause = string.Join(" OR ", patternPredicates);
 
+            string typeClause = BuildTypeClause(canonicalTypes);
+
             string rowCountSelect = includeRowCount ? ", ps.row_count" : "";
             string rowCountJoin = includeRowCount ? @"
 LEFT JOIN (
@@ -173,10 +273,7 @@ SELECT
 FROM sys.objects o
 INNER JOIN sys.schemas s ON o.schema_id = s.schema_id{rowCountJoin}
 WHERE o.is_ms_shipped = 0
-  AND (@Type = 'ALL' OR 
-       (@Type = 'TABLE' AND o.type = 'U') OR 
-       (@Type = 'VIEW' AND o.type = 'V') OR 
-       (@Type = 'PROCEDURE' AND o.type IN ('P', 'PC')))
+  AND {typeClause}
   AND ({patternClause})
 ORDER BY s.name, o.name;";
 
@@ -185,7 +282,6 @@ ORDER BY s.name, o.name;";
             {
                 cmd.Parameters.Add(new SqlParameter($"@Pattern_{i}", SqlDbType.NVarChar, 200) { Value = patternList[i] });
             }
-            cmd.Parameters.Add(new SqlParameter("@Type", SqlDbType.NVarChar, 20) { Value = objectType });
 
             var results = new List<object>();
             await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
@@ -263,5 +359,51 @@ ORDER BY s.name, o.name;";
     {
         string p = raw.Contains('%') ? raw : raw.Replace('*', '%');
         return p.Contains('%') ? p : $"%{p}%";
+    }
+
+    internal static string? NormalizeObjectType(string raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw)) return null;
+        string upper = raw.Trim().ToUpperInvariant();
+        return upper switch
+        {
+            "P" or "PC" or "PROC" or "PROCEDURE" or "PROCEDURES" => "PROCEDURE",
+            "U" or "T" or "TABLE" or "TABLES" => "TABLE",
+            "V" or "VIEW" or "VIEWS" => "VIEW",
+            "FN" or "IF" or "TF" or "FUNC" or "FUNCTION" or "FUNCTIONS" => "FUNCTION",
+            "ALL" or "*" => "ALL",
+            _ => upper
+        };
+    }
+
+    internal static string BuildTypeClause(IEnumerable<string> canonicalTypes)
+    {
+        var typesSet = new HashSet<string>(canonicalTypes, StringComparer.OrdinalIgnoreCase);
+        if (typesSet.Count == 0 || typesSet.Contains("ALL"))
+        {
+            return "1 = 1";
+        }
+
+        var typeConditions = new List<string>();
+        if (typesSet.Contains("PROCEDURE"))
+        {
+            typeConditions.Add("o.type IN ('P', 'PC')");
+        }
+        if (typesSet.Contains("TABLE"))
+        {
+            typeConditions.Add("o.type = 'U'");
+        }
+        if (typesSet.Contains("VIEW"))
+        {
+            typeConditions.Add("o.type = 'V'");
+        }
+        if (typesSet.Contains("FUNCTION"))
+        {
+            typeConditions.Add("o.type IN ('FN', 'IF', 'TF')");
+        }
+
+        return typeConditions.Count > 0
+            ? $"({string.Join(" OR ", typeConditions)})"
+            : "1 = 1";
     }
 }

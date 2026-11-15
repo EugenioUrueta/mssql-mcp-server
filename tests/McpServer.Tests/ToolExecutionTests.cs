@@ -371,4 +371,243 @@ public class ToolExecutionTests
             doc?.Dispose();
         }
     }
+
+    [Theory]
+    [InlineData("P", "PROCEDURE")]
+    [InlineData("PC", "PROCEDURE")]
+    [InlineData("proc", "PROCEDURE")]
+    [InlineData("PROCEDURE", "PROCEDURE")]
+    [InlineData("procedures", "PROCEDURE")]
+    [InlineData("U", "TABLE")]
+    [InlineData("t", "TABLE")]
+    [InlineData("TABLE", "TABLE")]
+    [InlineData("tables", "TABLE")]
+    [InlineData("v", "VIEW")]
+    [InlineData("view", "VIEW")]
+    [InlineData("views", "VIEW")]
+    [InlineData("FN", "FUNCTION")]
+    [InlineData("if", "FUNCTION")]
+    [InlineData("tf", "FUNCTION")]
+    [InlineData("FUNC", "FUNCTION")]
+    [InlineData("function", "FUNCTION")]
+    [InlineData("functions", "FUNCTION")]
+    [InlineData("ALL", "ALL")]
+    [InlineData("*", "ALL")]
+    public void SearchObjectsTool_NormalizeObjectType_CorrectlyMapsToCanonical(string input, string expected)
+    {
+        var method = typeof(SearchObjectsTool).GetMethod("NormalizeObjectType", BindingFlags.NonPublic | BindingFlags.Static);
+        Assert.NotNull(method);
+
+        string? result = method.Invoke(null, new object[] { input }) as string;
+        Assert.Equal(expected, result);
+    }
+
+    [Fact]
+    public void SearchObjectsTool_BuildTypeClause_GeneratesCorrectSqlConditions()
+    {
+        var method = typeof(SearchObjectsTool).GetMethod("BuildTypeClause", BindingFlags.NonPublic | BindingFlags.Static);
+        Assert.NotNull(method);
+
+        // Single type: PROCEDURE
+        string? sqlProc = method.Invoke(null, new object[] { new[] { "PROCEDURE" } }) as string;
+        Assert.Equal("(o.type IN ('P', 'PC'))", sqlProc);
+
+        // Single type: TABLE
+        string? sqlTable = method.Invoke(null, new object[] { new[] { "TABLE" } }) as string;
+        Assert.Equal("(o.type = 'U')", sqlTable);
+
+        // Single type: VIEW
+        string? sqlView = method.Invoke(null, new object[] { new[] { "VIEW" } }) as string;
+        Assert.Equal("(o.type = 'V')", sqlView);
+
+        // Single type: FUNCTION
+        string? sqlFunc = method.Invoke(null, new object[] { new[] { "FUNCTION" } }) as string;
+        Assert.Equal("(o.type IN ('FN', 'IF', 'TF'))", sqlFunc);
+
+        // Multiple types: PROCEDURE and TABLE
+        string? sqlMulti = method.Invoke(null, new object[] { new[] { "PROCEDURE", "TABLE" } }) as string;
+        Assert.Contains("o.type IN ('P', 'PC')", sqlMulti);
+        Assert.Contains("o.type = 'U'", sqlMulti);
+        Assert.Contains(" OR ", sqlMulti);
+
+        // ALL or empty: no type filter
+        string? sqlAll = method.Invoke(null, new object[] { new[] { "ALL" } }) as string;
+        Assert.Equal("1 = 1", sqlAll);
+
+        string? sqlEmpty = method.Invoke(null, new object[] { Array.Empty<string>() }) as string;
+        Assert.Equal("1 = 1", sqlEmpty);
+    }
+
+    [Theory]
+    [InlineData("""{"pattern": "orders", "object_types": ["P"]}""")]
+    [InlineData("""{"pattern": "orders", "types": ["PROCEDURE", "TABLE"]}""")]
+    [InlineData("""{"pattern": "orders", "type": "P"}""")]
+    [InlineData("""{"pattern": "orders", "object_type": "V"}""")]
+    [InlineData("""{"pattern": "orders", "types": "TABLE, PROCEDURE"}""")]
+    [InlineData("""{"pattern": "orders", "object_types": ["FN", "TF"]}""")]
+    [InlineData("""{"pattern": "orders", "type": "ALL"}""")]
+    public async Task SearchObjectsTool_AcceptsObjectTypesAliasesAndArrayFormats(string argsJson)
+    {
+        var tool = new SearchObjectsTool(_connectionManager, _validator);
+
+        using var doc = JsonDocument.Parse(argsJson);
+        var result = await tool.ExecuteAsync(doc.RootElement);
+
+        Assert.True(result.IsError);
+        Assert.DoesNotContain("parameter is required", result.Content[0].Text, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("Error searching database objects", result.Content[0].Text, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData("""{"search": "orders"}""")]
+    [InlineData("""{"search": "orders, inv_* | car_%"}""")]
+    [InlineData("""{"query": "customers"}""")]
+    [InlineData("""{"query": "inv_*, car_*"}""")]
+    public async Task SearchObjectsTool_AcceptsSearchAndQueryAliases(string argsJson)
+    {
+        var tool = new SearchObjectsTool(_connectionManager, _validator);
+
+        using var doc = JsonDocument.Parse(argsJson);
+        var result = await tool.ExecuteAsync(doc.RootElement);
+
+        Assert.True(result.IsError);
+        Assert.DoesNotContain("parameter is required", result.Content[0].Text, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("Error searching database objects", result.Content[0].Text, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task GetSpDefinitionTool_RejectsWhenParameterMissingOrEmpty()
+    {
+        var tool = new GetSpDefinitionTool(_connectionManager);
+
+        string[] invalidArgs = { "{}", """{"summary_only": true}""", """{"sp_name": "   "}""", """{"sp_names": []}""" };
+        foreach (var argsJson in invalidArgs)
+        {
+            using var doc = JsonDocument.Parse(argsJson);
+            var result = await tool.ExecuteAsync(doc.RootElement);
+
+            Assert.True(result.IsError);
+            Assert.Contains("sp_name", result.Content[0].Text, StringComparison.OrdinalIgnoreCase);
+        }
+    }
+
+    [Fact]
+    public async Task GetSpDefinitionTool_RejectsNullArguments()
+    {
+        var tool = new GetSpDefinitionTool(_connectionManager);
+        var result = await tool.ExecuteAsync(null);
+
+        Assert.True(result.IsError);
+        Assert.Contains("Arguments object is required", result.Content[0].Text, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData("""{"procedure_name": "usp_get_customer_orders"}""")]
+    [InlineData("""{"procedure": "dbo.usp_calculate_tax"}""")]
+    [InlineData("""{"sp": "usp_inventory_audit"}""")]
+    [InlineData("""{"name": "dbo.usp_invoices_sync"}""")]
+    public async Task GetSpDefinitionTool_AcceptsProcedureNameAliases(string argsJson)
+    {
+        var tool = new GetSpDefinitionTool(_connectionManager);
+
+        using var doc = JsonDocument.Parse(argsJson);
+        var result = await tool.ExecuteAsync(doc.RootElement);
+
+        Assert.True(result.IsError);
+        Assert.DoesNotContain("parameter is required", result.Content[0].Text, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("Error retrieving stored procedure definition", result.Content[0].Text, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData("""{"sp_names": ["usp_1", "usp_2"], "summary_only": true}""")]
+    [InlineData("""{"procedure_names": ["usp_1", "usp_2"], "compact": true}""")]
+    [InlineData("""{"procedures": ["usp_1", "usp_2"]}""")]
+    [InlineData("""{"names": ["usp_1", "usp_2"], "summary_only": true}""")]
+    [InlineData("""{"sp_name": "usp_1, usp_2", "summary_only": true}""")]
+    [InlineData("""{"sp_names": ["usp_1"]}""")]
+    public async Task GetSpDefinitionTool_AcceptsBatchAndSummaryOnly(string argsJson)
+    {
+        var tool = new GetSpDefinitionTool(_connectionManager);
+
+        using var doc = JsonDocument.Parse(argsJson);
+        var result = await tool.ExecuteAsync(doc.RootElement);
+
+        Assert.True(result.IsError);
+        Assert.DoesNotContain("parameter is required", result.Content[0].Text, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("Error retrieving stored procedure definition", result.Content[0].Text, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void GetSpDefinitionTool_FormatSingleResult_OmitsDefinitionWhenSummaryOnlyIsTrue()
+    {
+        var sample = new StoredProcedureInfo
+        {
+            Schema = "dbo",
+            Procedure = "usp_test",
+            FullName = "dbo.usp_test",
+            Created = "2026-01-01 10:00:00",
+            Modified = "2026-01-02 10:00:00",
+            ParameterCount = 1,
+            Parameters = new List<object>(),
+            Dependencies = null,
+            Definition = "CREATE PROCEDURE dbo.usp_test AS SELECT 1;"
+        };
+
+        // summaryOnly = false -> includes definition
+        object fullResult = GetSpDefinitionTool.FormatSingleResult("TestDB", sample, false);
+        string fullJson = JsonSerializer.Serialize(fullResult);
+        using (var doc = JsonDocument.Parse(fullJson))
+        {
+            Assert.True(doc.RootElement.TryGetProperty("definition", out var defProp));
+            Assert.Equal("CREATE PROCEDURE dbo.usp_test AS SELECT 1;", defProp.GetString());
+            Assert.Equal("TestDB", doc.RootElement.GetProperty("database").GetString());
+            Assert.Equal("dbo.usp_test", doc.RootElement.GetProperty("fullName").GetString());
+        }
+
+        // summaryOnly = true -> omits definition
+        object summaryResult = GetSpDefinitionTool.FormatSingleResult("TestDB", sample, true);
+        string summaryJson = JsonSerializer.Serialize(summaryResult);
+        using (var doc = JsonDocument.Parse(summaryJson))
+        {
+            Assert.False(doc.RootElement.TryGetProperty("definition", out _));
+            Assert.Equal("TestDB", doc.RootElement.GetProperty("database").GetString());
+            Assert.Equal("dbo.usp_test", doc.RootElement.GetProperty("fullName").GetString());
+            Assert.Equal(1, doc.RootElement.GetProperty("parameterCount").GetInt32());
+        }
+    }
+
+    [Theory]
+    [InlineData("""{"table": "dbo.User_Passwords"}""")]
+    [InlineData("""{"name": "dbo.User_Passwords"}""")]
+    [InlineData("""{"tables": ["dbo.User_Passwords", "dbo.Clientes"]}""")]
+    [InlineData("""{"names": ["dbo.User_Passwords"]}""")]
+    [InlineData("""{"table": "dbo.Clientes, dbo.User_Passwords"}""")]
+    public async Task GetTableSchemaTool_RejectsDeniedTables_WithAliases(string argsJson)
+    {
+        var tool = new GetTableSchemaTool(_connectionManager, _validator);
+
+        using var doc = JsonDocument.Parse(argsJson);
+        var result = await tool.ExecuteAsync(doc.RootElement);
+
+        Assert.True(result.IsError);
+        Assert.Contains("guardrail blocked", result.Content[0].Text, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData("""{"table": "dbo.Orders"}""")]
+    [InlineData("""{"name": "dbo.Clientes"}""")]
+    [InlineData("""{"tables": ["dbo.Orders", "dbo.Clientes"]}""")]
+    [InlineData("""{"names": ["dbo.Invoices"]}""")]
+    [InlineData("""{"tables": ["dbo.Orders"]}""")]
+    public async Task GetTableSchemaTool_AcceptsTableAliases_ProceedsPastValidation(string argsJson)
+    {
+        var tool = new GetTableSchemaTool(_connectionManager, _validator);
+
+        using var doc = JsonDocument.Parse(argsJson);
+        var result = await tool.ExecuteAsync(doc.RootElement);
+
+        Assert.True(result.IsError);
+        Assert.DoesNotContain("parameter is required", result.Content[0].Text, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("Error retrieving table schema", result.Content[0].Text, StringComparison.OrdinalIgnoreCase);
+    }
 }
