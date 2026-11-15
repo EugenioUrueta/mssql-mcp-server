@@ -51,7 +51,7 @@ public class SearchObjectsTool : IMcpToolHandler
                 include_row_count = new
                 {
                     type = "boolean",
-                    description = "Whether to include approximate row count for tables (via sys.dm_db_partition_stats). Default is false."
+                    description = "Whether to include approximate row count for tables (via sys.partitions). Default is false."
                 },
                 profile = new
                 {
@@ -148,8 +148,8 @@ public class SearchObjectsTool : IMcpToolHandler
             string rowCountSelect = includeRowCount ? ", ps.row_count" : "";
             string rowCountJoin = includeRowCount ? @"
 LEFT JOIN (
-    SELECT object_id, SUM(row_count) AS row_count
-    FROM sys.dm_db_partition_stats
+    SELECT object_id, SUM(rows) AS row_count
+    FROM sys.partitions
     WHERE index_id IN (0, 1)
     GROUP BY object_id
 ) ps ON o.object_id = ps.object_id" : "";
