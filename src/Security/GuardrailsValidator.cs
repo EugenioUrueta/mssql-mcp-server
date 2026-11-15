@@ -1,0 +1,270 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Security;
+using System.Text;
+using System.Text.RegularExpressions;
+using MssqlMcpServer.Configuration;
+
+namespace MssqlMcpServer.Security;
+
+/// <summary>
+/// Enforces security guardrails, database and table access restrictions, and query safety.
+/// </summary>
+public class GuardrailsValidator
+{
+    private readonly GlobalSecurity _security;
+
+    private static readonly HashSet<string> HazardousKeywords = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "CREATE", "TRUNCATE",
+        "EXEC", "EXECUTE", "MERGE", "GRANT", "REVOKE", "DENY", "SHUTDOWN",
+        "BACKUP", "RESTORE", "RECONFIGURE", "DBCC", "INTO",
+        "OPENROWSET", "OPENDATASOURCE", "OPENQUERY", "KILL", "SP_EXECUTESQL"
+    };
+
+    private static readonly Regex HazardousRegex = new(
+        @"\b(" + string.Join("|", new[]
+        {
+            "INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "CREATE", "TRUNCATE",
+            "EXEC", "EXECUTE", "MERGE", "GRANT", "REVOKE", "DENY", "SHUTDOWN",
+            "BACKUP", "RESTORE", "RECONFIGURE", "DBCC", "INTO",
+            "OPENROWSET", "OPENDATASOURCE", "OPENQUERY", "KILL", "SP_EXECUTESQL",
+            @"XP_[A-Z0-9_]+"
+        }) + @")\b",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    public GuardrailsValidator(GlobalSecurity security)
+    {
+        _security = security ?? new GlobalSecurity();
+    }
+
+    /// <summary>
+    /// Validates whether access to the target database is allowed for the given profile.
+    /// </summary>
+    public void ValidateDatabase(string database, ProfileConfig profile)
+    {
+        if (string.IsNullOrWhiteSpace(database))
+            throw new ArgumentException("Database name cannot be empty.", nameof(database));
+
+        string cleanDb = database.Trim().Trim('[', ']');
+
+        // 1. Check global denied databases
+        if (WildcardMatcher.MatchesAny(cleanDb, _security.DeniedDatabases))
+        {
+            throw new SecurityException($"Access to database '{cleanDb}' is denied by global security policy.");
+        }
+
+        // 2. Check profile allowed databases
+        if (profile.AllowedDatabases != null && profile.AllowedDatabases.Count > 0)
+        {
+            bool allowed = WildcardMatcher.MatchesAny(cleanDb, profile.AllowedDatabases);
+            if (!allowed)
+            {
+                throw new SecurityException($"Database '{cleanDb}' is not in the allowed databases list for profile '{profile.Description}'.");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Validates whether access to the target table is allowed.
+    /// </summary>
+    public void ValidateTable(string tableName)
+    {
+        if (string.IsNullOrWhiteSpace(tableName))
+            throw new ArgumentException("Table name cannot be empty.", nameof(tableName));
+
+        // Normalize table name: remove brackets and isolate schema / object name
+        string cleanTable = tableName.Trim();
+        string[] parts = cleanTable.Split('.', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        string objectName = (parts.Length > 0 ? parts[^1] : cleanTable).Trim('[', ']');
+
+        // Check against denied table patterns
+        if (WildcardMatcher.MatchesAny(objectName, _security.DeniedTables) ||
+            WildcardMatcher.MatchesAny(cleanTable.Replace("[", "").Replace("]", ""), _security.DeniedTables))
+        {
+            throw new SecurityException($"Access to table '{cleanTable}' is blocked by security guardrails (denied table pattern).");
+        }
+    }
+
+    /// <summary>
+    /// Checks whether a column matches the denied columns policy.
+    /// </summary>
+    public bool IsColumnDenied(string columnName)
+    {
+        if (string.IsNullOrWhiteSpace(columnName))
+            return false;
+
+        string cleanCol = columnName.Trim().Trim('[', ']');
+        return WildcardMatcher.MatchesAny(cleanCol, _security.DeniedColumns);
+    }
+
+    /// <summary>
+    /// Validates whether the profile allows executing stored procedures (live or simulation).
+    /// </summary>
+    public void ValidateExecutionPermissions(ProfileConfig profile, bool simulate)
+    {
+        if (simulate)
+        {
+            if (!profile.AllowSimulation)
+            {
+                throw new SecurityException("Simulation mode is not permitted on this profile.");
+            }
+            return;
+        }
+
+        if (profile.IsReadOnly)
+        {
+            throw new SecurityException("Current profile is read-only. Live execution of stored procedures is prohibited.");
+        }
+
+        if (!profile.AllowExecuteSp)
+        {
+            throw new SecurityException("Stored procedure execution is disabled on this profile.");
+        }
+    }
+
+    /// <summary>
+    /// Validates that a SQL query is strictly read-only (SELECT / WITH CTE) and does not contain dangerous operations.
+    /// </summary>
+    public QuerySafetyResult ValidateReadQuery(string query)
+    {
+        if (string.IsNullOrWhiteSpace(query))
+            return QuerySafetyResult.Unsafe("Query cannot be empty.");
+
+        // 1. Strip comments and string literals to inspect query structure
+        string strippedSql = StripCommentsAndStrings(query, out bool hasUnclosedString, out bool hasMultipleStatements);
+
+        if (hasUnclosedString)
+            return QuerySafetyResult.Unsafe("Query has unclosed string literals.");
+
+        if (hasMultipleStatements)
+            return QuerySafetyResult.Unsafe("Stacked queries and multiple statements separated by ';' are prohibited.");
+
+        string trimmed = strippedSql.Trim();
+        if (string.IsNullOrEmpty(trimmed))
+            return QuerySafetyResult.Unsafe("Query has no executable statements after stripping comments.");
+
+        // 2. Check starting statement keyword (must start with SELECT or WITH)
+        var matchFirstWord = Regex.Match(trimmed, @"^[A-Z]+", RegexOptions.IgnoreCase);
+        if (!matchFirstWord.Success)
+            return QuerySafetyResult.Unsafe("Unable to determine query root command.");
+
+        string rootCommand = matchFirstWord.Value.ToUpperInvariant();
+        if (rootCommand != "SELECT" && rootCommand != "WITH")
+        {
+            return QuerySafetyResult.Unsafe($"Only 'SELECT' or 'WITH' (CTE) queries are permitted in read_query. Detected root command: '{rootCommand}'.");
+        }
+
+        // 3. Scan for hazardous keywords outside strings and comments
+        var hazardousMatch = HazardousRegex.Match(strippedSql);
+        if (hazardousMatch.Success)
+        {
+            string keyword = hazardousMatch.Value.ToUpperInvariant();
+            return QuerySafetyResult.Unsafe($"Hazardous or modification keyword '{keyword}' is prohibited in read_query.");
+        }
+
+        return QuerySafetyResult.Safe();
+    }
+
+    /// <summary>
+    /// Helper to remove comments (-- and /* */) and replace string literals ('...') with a safe placeholder.
+    /// Also detects semicolons separating statements.
+    /// </summary>
+    private static string StripCommentsAndStrings(string sql, out bool hasUnclosedString, out bool hasMultipleStatements)
+    {
+        hasUnclosedString = false;
+        hasMultipleStatements = false;
+
+        var sb = new StringBuilder(sql.Length);
+        int len = sql.Length;
+        int i = 0;
+        bool foundSemicolon = false;
+
+        while (i < len)
+        {
+            char c = sql[i];
+
+            // String literal: '...'
+            if (c == '\'')
+            {
+                sb.Append("'STR'");
+                i++;
+                bool closed = false;
+                while (i < len)
+                {
+                    if (sql[i] == '\'')
+                    {
+                        // Check for escaped quote ''
+                        if (i + 1 < len && sql[i + 1] == '\'')
+                        {
+                            i += 2;
+                            continue;
+                        }
+                        closed = true;
+                        i++;
+                        break;
+                    }
+                    i++;
+                }
+                if (!closed)
+                {
+                    hasUnclosedString = true;
+                    return string.Empty;
+                }
+                continue;
+            }
+
+            // Single line comment: --
+            if (c == '-' && i + 1 < len && sql[i + 1] == '-')
+            {
+                i += 2;
+                while (i < len && sql[i] != '\n' && sql[i] != '\r')
+                {
+                    i++;
+                }
+                sb.Append(' ');
+                continue;
+            }
+
+            // Block comment: /* ... */
+            if (c == '/' && i + 1 < len && sql[i + 1] == '*')
+            {
+                i += 2;
+                while (i < len)
+                {
+                    if (sql[i] == '*' && i + 1 < len && sql[i + 1] == '/')
+                    {
+                        i += 2;
+                        break;
+                    }
+                    i++;
+                }
+                sb.Append(' ');
+                continue;
+            }
+
+            // Check statement separator ;
+            if (c == ';')
+            {
+                foundSemicolon = true;
+                sb.Append(' ');
+                i++;
+                continue;
+            }
+
+            // If a semicolon was previously encountered and we see non-whitespace, that's multiple statements!
+            if (foundSemicolon && !char.IsWhiteSpace(c))
+            {
+                hasMultipleStatements = true;
+                break;
+            }
+
+            sb.Append(c);
+            i++;
+        }
+
+        return sb.ToString();
+    }
+}

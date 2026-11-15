@@ -1,0 +1,44 @@
+## Build results
+[Dd]ebug/
+[Dd]ebugPublic/
+[Rr]elease/
+[Rr]eleases/
+x64/
+x86/
+[Aa][Rr][Mm]/
+[Aa][Rr][Mm]64/
+bld/
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+[Ll]ogs/
+logs/
+*.log
+*.jsonl
+
+## Distribution & Publishing
+dist/
+publish/
+
+## Configuration & Secrets
+appsettings.json
+appsettings.*.json
+!appsettings.example.json
+mcp_config.json
+.agents/
+
+## Visual Studio / VS Code
+.vs/
+.vscode/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+## Rider / JetBrains
+.idea/
+*.DotSettings.user
+
+## OS Files
+.DS_Store
+Thumbs.db
