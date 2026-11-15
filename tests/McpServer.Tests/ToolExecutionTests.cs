@@ -310,4 +310,65 @@ public class ToolExecutionTests
         Assert.True(result.IsError);
         Assert.Contains("read-only", result.Content[0].Text, StringComparison.OrdinalIgnoreCase);
     }
+
+    [Fact]
+    public void GetDatabaseSummaryTool_Definition_HasExpectedProperties()
+    {
+        var tool = new GetDatabaseSummaryTool(_connectionManager, _validator);
+
+        Assert.Equal("get_database_summary", tool.Definition.Name);
+        Assert.Contains("executive summary", tool.Definition.Description, StringComparison.OrdinalIgnoreCase);
+        Assert.NotNull(tool.Definition.InputSchema);
+    }
+
+    [Theory]
+    [InlineData("main_orders", "main")]
+    [InlineData("MAIN_CUSTOMERS", "main")]
+    [InlineData("car_recibos_nc", "car")]
+    [InlineData("CAR_PAGOS", "car")]
+    [InlineData("gen_articulos", "gen")]
+    [InlineData("tes_egresos", "tes")]
+    [InlineData("base_empresas", "base")]
+    [InlineData("Clientes", "general")]
+    [InlineData("usuarios", "general")]
+    [InlineData("_temp_table", "general")]
+    [InlineData("", "general")]
+    [InlineData(null, "general")]
+    public void GetDatabaseSummaryTool_ExtractModulePrefix_CorrectlyGroupsTables(string? tableName, string expectedModule)
+    {
+        string result = GetDatabaseSummaryTool.ExtractModulePrefix(tableName!);
+        Assert.Equal(expectedModule, result);
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("{}")]
+    [InlineData("""{"include_empty_tables": false, "indent": true}""")]
+    [InlineData("""{"profile": "dev", "database": "DB_Test_Dev"}""")]
+    public async Task GetDatabaseSummaryTool_AcceptsValidOrNullArguments_AttemptsConnection(string? argsJson)
+    {
+        var tool = new GetDatabaseSummaryTool(_connectionManager, _validator);
+
+        JsonElement? args = null;
+        JsonDocument? doc = null;
+        if (argsJson != null)
+        {
+            doc = JsonDocument.Parse(argsJson);
+            args = doc.RootElement;
+        }
+
+        try
+        {
+            var result = await tool.ExecuteAsync(args);
+
+            // Since there is no live SQL server running at localhost, it should fail at the connection level,
+            // returning a handled McpToolCallResult error without throwing an uncaught exception.
+            Assert.True(result.IsError);
+            Assert.Contains("Error generating database summary", result.Content[0].Text, StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            doc?.Dispose();
+        }
+    }
 }

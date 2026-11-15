@@ -22,7 +22,7 @@ public class GetSpDefinitionTool : IMcpToolHandler
     public McpToolDefinition Definition => new()
     {
         Name = "get_sp_definition",
-        Description = "Retrieves the full T-SQL definition and typed parameters metadata for a stored procedure.",
+        Description = "Retrieves the full T-SQL definition, typed parameters metadata, and referenced object dependencies for a stored procedure.",
         InputSchema = new
         {
             type = "object",
@@ -33,6 +33,11 @@ public class GetSpDefinitionTool : IMcpToolHandler
                     type = "string",
                     description = "Name of the stored procedure (e.g. 'usp_get_customer_orders' or 'dbo.usp_get_customer_orders')."
                 },
+                include_dependencies = new
+                {
+                    type = "boolean",
+                    description = "Whether to analyze and return referenced database objects (tables, views, other procedures). Default is false."
+                },
                 profile = new
                 {
                     type = "string",
@@ -42,6 +47,11 @@ public class GetSpDefinitionTool : IMcpToolHandler
                 {
                     type = "string",
                     description = "Target database (optional, defaults to active database)."
+                },
+                indent = new
+                {
+                    type = "boolean",
+                    description = "Whether to format JSON with indentation. Default is false."
                 }
             },
             required = new[] { "sp_name" }
@@ -63,6 +73,20 @@ public class GetSpDefinitionTool : IMcpToolHandler
         string rawSp = spProp.GetString()!.Trim();
         string? profile = arguments.Value.TryGetProperty("profile", out var prProp) ? prProp.GetString() : null;
         string? database = arguments.Value.TryGetProperty("database", out var dbProp) ? dbProp.GetString() : null;
+
+        bool includeDependencies = false;
+        if (arguments.Value.TryGetProperty("include_dependencies", out var incProp) &&
+            (incProp.ValueKind == JsonValueKind.True || incProp.ValueKind == JsonValueKind.False))
+        {
+            includeDependencies = incProp.GetBoolean();
+        }
+
+        bool indent = false;
+        if (arguments.Value.TryGetProperty("indent", out var indProp) &&
+            (indProp.ValueKind == JsonValueKind.True || indProp.ValueKind == JsonValueKind.False))
+        {
+            indent = indProp.GetBoolean();
+        }
 
         // Parse schema and procedure name
         string schemaName = "dbo";
@@ -155,6 +179,68 @@ ORDER BY p.parameter_id;";
                 }
             }
 
+            // 3. Dependencies query (optional)
+            object? dependenciesObj = null;
+            if (includeDependencies)
+            {
+                const string depSql = @"
+SELECT DISTINCT 
+    COALESCE(sed.referenced_schema_name, 'dbo') AS ref_schema,
+    sed.referenced_entity_name AS ref_entity,
+    COALESCE(o.type_desc, 'UNKNOWN') AS ref_type
+FROM sys.sql_expression_dependencies sed
+INNER JOIN sys.objects parent ON sed.referencing_id = parent.object_id
+INNER JOIN sys.schemas ps ON parent.schema_id = ps.schema_id
+LEFT JOIN sys.objects o ON sed.referenced_id = o.object_id
+WHERE ps.name = @SchemaName AND parent.name = @SpName
+ORDER BY ref_schema, sed.referenced_entity_name;";
+
+                await using var cmdDep = new SqlCommand(depSql, connection);
+                cmdDep.Parameters.Add(new SqlParameter("@SchemaName", SqlDbType.NVarChar, 128) { Value = schemaName });
+                cmdDep.Parameters.Add(new SqlParameter("@SpName", SqlDbType.NVarChar, 128) { Value = spName });
+
+                var refTables = new List<string>();
+                var refViews = new List<string>();
+                var refProcedures = new List<string>();
+                var refOthers = new List<string>();
+
+                await using (var reader = await cmdDep.ExecuteReaderAsync(cancellationToken))
+                {
+                    while (await reader.ReadAsync(cancellationToken))
+                    {
+                        string rSchema = reader.GetString(0);
+                        string rEntity = reader.GetString(1);
+                        string rType = reader.GetString(2);
+                        string fullRef = $"{rSchema}.{rEntity}";
+
+                        if (rType.Contains("TABLE"))
+                        {
+                            refTables.Add(fullRef);
+                        }
+                        else if (rType.Contains("VIEW"))
+                        {
+                            refViews.Add(fullRef);
+                        }
+                        else if (rType.Contains("PROCEDURE"))
+                        {
+                            refProcedures.Add(fullRef);
+                        }
+                        else
+                        {
+                            refOthers.Add(fullRef);
+                        }
+                    }
+                }
+
+                dependenciesObj = new
+                {
+                    tables = refTables,
+                    views = refViews,
+                    procedures = refProcedures,
+                    others = refOthers
+                };
+            }
+
             var result = new
             {
                 database = connection.Database,
@@ -165,10 +251,11 @@ ORDER BY p.parameter_id;";
                 modified = modified?.ToString("yyyy-MM-dd HH:mm:ss"),
                 parameterCount = parameters.Count,
                 parameters,
+                dependencies = dependenciesObj,
                 definition
             };
 
-            return McpToolCallResult.Success(JsonSerializer.Serialize(result, new JsonSerializerOptions { WriteIndented = true }));
+            return McpToolCallResult.Success(JsonSerializer.Serialize(result, new JsonSerializerOptions { WriteIndented = indent }));
         }
         catch (Exception ex)
         {

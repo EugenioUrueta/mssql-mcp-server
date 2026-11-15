@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Data;
 using System.Text.Json;
@@ -15,6 +16,7 @@ public class GetTableSchemaTool : IMcpToolHandler
 {
     private readonly InstanceConnectionManager _connectionManager;
     private readonly GuardrailsValidator _validator;
+    private readonly ConcurrentDictionary<string, (object Result, DateTime Expiry)> _schemaCache = new(StringComparer.OrdinalIgnoreCase);
 
     public GetTableSchemaTool(InstanceConnectionManager connectionManager, GuardrailsValidator validator)
     {
@@ -61,6 +63,11 @@ public class GetTableSchemaTool : IMcpToolHandler
                 {
                     type = "boolean",
                     description = "Whether to format JSON with indentation. Default is false."
+                },
+                no_cache = new
+                {
+                    type = "boolean",
+                    description = "Whether to bypass the in-memory schema cache (TTL 5 min). Default is false."
                 }
             }
         }
@@ -134,6 +141,13 @@ public class GetTableSchemaTool : IMcpToolHandler
             indent = indProp.GetBoolean();
         }
 
+        bool noCache = false;
+        if (arguments.Value.TryGetProperty("no_cache", out var ncProp) &&
+            (ncProp.ValueKind == JsonValueKind.True || ncProp.ValueKind == JsonValueKind.False))
+        {
+            noCache = ncProp.GetBoolean();
+        }
+
         string? profile = arguments.Value.TryGetProperty("profile", out var prProp) ? prProp.GetString() : null;
         string? database = arguments.Value.TryGetProperty("database", out var dbProp) ? dbProp.GetString() : null;
 
@@ -153,7 +167,7 @@ public class GetTableSchemaTool : IMcpToolHandler
                     tableName = parts[1];
                 }
 
-                var (schemaObj, error) = await GetSingleTableSchemaAsync(connection, schemaName, tableName, compact, cancellationToken);
+                var (schemaObj, error) = await GetSingleTableSchemaAsync(connection, schemaName, tableName, compact, noCache, cancellationToken);
                 if (error != null)
                 {
                     if (tableList.Count == 1)
@@ -209,8 +223,15 @@ public class GetTableSchemaTool : IMcpToolHandler
         string schemaName,
         string tableName,
         bool compact,
+        bool noCache,
         CancellationToken cancellationToken)
     {
+        string cacheKey = $"{connection.Database}:{schemaName}.{tableName}:{(compact ? "compact" : "full")}";
+        if (!noCache && _schemaCache.TryGetValue(cacheKey, out var cached) && DateTime.UtcNow < cached.Expiry)
+        {
+            return (cached.Result, null);
+        }
+
         // 1. Primary Key query
         const string pkSql = @"
 SELECT 
@@ -418,6 +439,8 @@ GROUP BY i.name, i.type_desc, i.is_unique, i.is_primary_key;";
                 foreignKeys,
                 indexes
             };
+
+        _schemaCache[cacheKey] = (result, DateTime.UtcNow.AddMinutes(5));
 
         return (result, null);
     }

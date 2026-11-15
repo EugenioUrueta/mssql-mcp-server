@@ -73,11 +73,11 @@ public class Program
             }
             if (settings.Security.DeniedTables.Count == 0)
             {
-                settings.Security.DeniedTables = new() { "*Password*", "*Token*", "*Secret*", "*Session*", "*Credential*" };
+                settings.Security.DeniedTables = new() { "*Password*", "*Token*", "*Secret*", "*Session*", "*Credential*", "*Clave*", "*Passw*" };
             }
             if (settings.Security.DeniedColumns.Count == 0)
             {
-                settings.Security.DeniedColumns = new() { "*Password*", "*Token*", "*Secret*", "*Hash*", "*Salt*" };
+                settings.Security.DeniedColumns = new() { "*Password*", "*Token*", "*Secret*", "*Hash*", "*Salt*", "*Clave*", "*Passw*", "*Contrasen*", "*Pin*" };
             }
 
             // Initialize Core Services
@@ -93,6 +93,7 @@ public class Program
                 new SwitchContextTool(sessionContext, connectionManager),
                 new SearchObjectsTool(connectionManager, validator),
                 new GetTableSchemaTool(connectionManager, validator),
+                new GetDatabaseSummaryTool(connectionManager, validator),
                 new GetSpDefinitionTool(connectionManager),
                 new ExecuteSpTool(connectionManager, validator),
                 new ReadQueryTool(connectionManager, validator, settings.Security)

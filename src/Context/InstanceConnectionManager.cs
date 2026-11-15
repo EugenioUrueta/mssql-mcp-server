@@ -106,7 +106,7 @@ public class InstanceConnectionManager
     }
 
     /// <summary>
-    /// Opens and returns a new SqlConnection for the specified or active context.
+    /// Opens and returns a new SqlConnection for the specified or active context with automatic transient retry resilience.
     /// </summary>
     public async Task<SqlConnection> OpenConnectionAsync(
         string? profileName,
@@ -114,8 +114,60 @@ public class InstanceConnectionManager
         CancellationToken cancellationToken = default)
     {
         string connectionString = BuildConnectionString(profileName, requestedDatabase, out _, out _, out _);
-        var connection = new SqlConnection(connectionString);
-        await connection.OpenAsync(cancellationToken);
-        return connection;
+
+        const int maxAttempts = 2;
+        for (int attempt = 1; attempt <= maxAttempts; attempt++)
+        {
+            var connection = new SqlConnection(connectionString);
+            try
+            {
+                await connection.OpenAsync(cancellationToken);
+                return connection;
+            }
+            catch (SqlException ex) when (attempt < maxAttempts && IsTransient(ex))
+            {
+                await connection.DisposeAsync();
+                SqlConnection.ClearPool(connection);
+                await Task.Delay(500, cancellationToken);
+            }
+            catch
+            {
+                await connection.DisposeAsync();
+                throw;
+            }
+        }
+
+        var fallbackConnection = new SqlConnection(connectionString);
+        await fallbackConnection.OpenAsync(cancellationToken);
+        return fallbackConnection;
+    }
+
+    private static bool IsTransient(SqlException ex)
+    {
+        foreach (SqlError error in ex.Errors)
+        {
+            switch (error.Number)
+            {
+                case -2:
+                case -1:
+                case 2:
+                case 53:
+                case 121:
+                case 233:
+                case 10053:
+                case 10054:
+                case 10060:
+                case 4060:
+                case 40143:
+                case 40197:
+                case 40501:
+                case 40613:
+                case 49918:
+                case 49919:
+                case 49920:
+                    return true;
+            }
+        }
+        return false;
     }
 }

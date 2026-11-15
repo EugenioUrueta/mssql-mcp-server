@@ -27,7 +27,9 @@ public class GlobalSecurity
         "*Token*",
         "*Secret*",
         "*Session*",
-        "*Credential*"
+        "*Credential*",
+        "*Clave*",
+        "*Passw*"
     };
 
     /// <summary>
@@ -39,7 +41,11 @@ public class GlobalSecurity
         "*Token*",
         "*Secret*",
         "*Hash*",
-        "*Salt*"
+        "*Salt*",
+        "*Clave*",
+        "*Passw*",
+        "*Contrasen*",
+        "*Pin*"
     };
 
     /// <summary>
