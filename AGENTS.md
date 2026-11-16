@@ -81,11 +81,13 @@ tools/mssql-mcp-server/
    - Para garantizar lecturas no bloqueantes y matemáticamente inmunes a mutación de datos accidental, cada consulta de `read_query` se ejecuta dentro de una transacción con nivel de aislamiento `READ UNCOMMITTED`. Al finalizar la lectura, la transacción se aborta incondicionalmente mediante `ROLLBACK` en un bloque `finally`, garantizando cero bloqueos (equivalente a `NOLOCK`) y asegurando que ninguna modificación pueda persistir jamás.
 3. **Prohibición Estricta de Identificadores de Cuatro Partes (Linked Servers)**:
    - Se prohíbe terminantemente el uso de identificadores de 4 partes (`server.database.schema.object`, `server.db..tbl`, `server...tbl`, `[server].[db].[schema].[tbl]`, `[server]...[tbl]`, etc.) tanto en consultas libres de `read_query` como en los parámetros de objetos de `execute_sp`, `get_table_schema`, `get_sp_definition` y `get_procedure_signatures` (`ProhibitFourPartNames = true`). Esto neutraliza cualquier intento de escape hacia servidores vinculados no autorizados.
-4. **Desactivación de `execute_sp` por Defecto**:
+4. **Identificadores delimitados opacos**:
+   - El análisis léxico de `read_query` trata `[...]` y `"..."` (con sus escapes `]]` y `""`) como identificadores, nunca como código. Apóstrofos, `--`, `/*` o `;` dentro de ellos no abren cadenas, comentarios ni sentencias. Un identificador sin cerrar, o cualquier cadena o identificador después de un `;`, se rechaza.
+5. **Desactivación de `execute_sp` por Defecto**:
    - Siguiendo el principio de menor privilegio, la ejecución y simulación de procedimientos almacenados (`execute_sp`) se encuentran desactivadas por defecto en todos los perfiles (`AllowExecuteSp: false`, `AllowSimulation: false`). Para permitir la invocación o simulación en un perfil específico, debe configurarse explícitamente `"AllowExecuteSp": true` y/o `"AllowSimulation": true`.
-5. **Enmascaramiento de Datos Sensibles y Cadenas de Conexión**:
+6. **Enmascaramiento de Datos Sensibles y Cadenas de Conexión**:
    - Todo resultado de consulta procesado por `read_query` enmascara automáticamente valores de columnas que coincidan con patrones sensibles tanto en inglés como en español (`*Password*`, `*Token*`, `*Secret*`, `*Hash*`, `*Salt*`, `*Clave*`, `*Passw*`, `*Contrasen*`, `*Pin*`, `*Conexion*`, `*Connection*`, `*ConnectionString*`, `*CadenaConexion*`). Los valores son reemplazados por `"***RESTRICTED***"`.
-6. **Compatibilidad SQL Universal**:
+7. **Compatibilidad SQL Universal**:
    - Toda introspección que utilice agregación de cadenas debe contemplar bases de datos con `compatibility_level` inferior a 140 (SQL Server 2008 / 2012 / 2014 / 2016), utilizando `FOR XML PATH(''), TYPE).value('.', 'NVARCHAR(MAX)')` en lugar de asumir la disponibilidad de `STRING_AGG`.
 
 ---

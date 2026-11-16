@@ -430,4 +430,40 @@ public class GuardrailsValidatorTests
         Assert.False(result.IsSafe);
         Assert.Contains("DROP", result.ErrorMessage);
     }
+
+    [Theory]
+    // Delimited identifiers hiding a linked server reference
+    [InlineData("SELECT [x'].* FROM LINKED_SRV.app_db_prod.dbo.users AS [x']")]
+    [InlineData("SELECT \"x'\".* FROM LINKED_SRV.app_db_prod.dbo.users AS \"x'\"")]
+    [InlineData("SELECT [a--b], * FROM LINKED_SRV.app_db_prod.dbo.users")]
+    [InlineData("SELECT [a/*b], * FROM LINKED_SRV.app_db_prod.dbo.users AS [c*/d]")]
+    // Delimited identifiers hiding stacked statements or hazardous keywords
+    [InlineData("SELECT 1 AS [a'];DELETE FROM orders;SELECT 1 AS [b']")]
+    [InlineData("SELECT [x'] FROM orders WHERE 1=(SELECT 1 FROM OPENQUERY(LINKED_SRV,'SELECT 1')) AND [y']=1")]
+    // Anything after ';'
+    [InlineData("SELECT 1;[app_db_prod].[dbo].[usp_add_order]")]
+    [InlineData("SELECT 1;'x'")]
+    // Unclosed delimited identifiers
+    [InlineData("SELECT [abc FROM orders")]
+    [InlineData("SELECT \"abc FROM orders")]
+    public void ValidateReadQuery_ShouldReject_GuardrailEvasionThroughDelimitedIdentifiers(string sql)
+    {
+        var result = _validator.ValidateReadQuery(sql);
+        Assert.False(result.IsSafe, $"Query '{sql}' should have been rejected.");
+    }
+
+    [Theory]
+    [InlineData("SELECT [Col]]Name] FROM orders")]
+    [InlineData("SELECT \"Col\"\"Name\" FROM orders")]
+    [InlineData("SELECT [Delete], [Insert] FROM audit_logs")]
+    [InlineData("SELECT [o'brien] FROM customers")]
+    [InlineData("SELECT * FROM [app_db_dev].[dbo].[orders]")]
+    [InlineData("SELECT * FROM audit_logs WHERE note = 'see [LINKED_SRV].[db].[dbo].[t]'")]
+    [InlineData("SELECT * FROM orders;")]
+    [InlineData("SELECT * FROM orders; -- done")]
+    public void ValidateReadQuery_ShouldAllow_ValidDelimitedIdentifiers(string sql)
+    {
+        var result = _validator.ValidateReadQuery(sql);
+        Assert.True(result.IsSafe, $"Query '{sql}' was unexpectedly rejected: {result.ErrorMessage}");
+    }
 }

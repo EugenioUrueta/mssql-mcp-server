@@ -249,6 +249,31 @@ public class GuardrailsValidator
     }
 
     /// <summary>
+    /// Skips a delimited identifier ([name] or "name") that starts at <paramref name="start"/>.
+    /// The closing delimiter is escaped by doubling it (]] or "").
+    /// Returns the index right after the closing delimiter, or -1 if the identifier is not closed.
+    /// </summary>
+    private static int SkipDelimitedIdentifier(string sql, int start, char close)
+    {
+        int len = sql.Length;
+        int i = start + 1; // skip the opening delimiter
+        while (i < len)
+        {
+            if (sql[i] == close)
+            {
+                if (i + 1 < len && sql[i + 1] == close)
+                {
+                    i += 2; // escaped delimiter, still inside the identifier
+                    continue;
+                }
+                return i + 1;
+            }
+            i++;
+        }
+        return -1;
+    }
+
+    /// <summary>
     /// Helper to remove comments (-- and /* */), replace string literals ('...') with a safe placeholder,
     /// and preserve delimited identifiers ([...] and "...") so that subsequent guardrails (4-part names,
     /// hazardous keywords) correctly inspect the query structure without being bypassed by characters inside identifiers.
@@ -267,6 +292,29 @@ public class GuardrailsValidator
         while (i < len)
         {
             char c = sql[i];
+
+            // Anything that starts after a ';' is a second statement, even a string or an identifier.
+            if (foundSemicolon && (c == '[' || c == '"' || c == '\''))
+            {
+                hasMultipleStatements = true;
+                break;
+            }
+
+            // Delimited identifiers: [name] and "name". Their content is never code, so quotes,
+            // comment markers or ';' inside them must not be interpreted. They are replaced by a
+            // placeholder that keeps the identifier shape, so the four-part check still works.
+            if (c == '[' || c == '"')
+            {
+                int end = SkipDelimitedIdentifier(sql, i, c == '[' ? ']' : '"');
+                if (end < 0)
+                {
+                    hasUnclosedString = true; // unclosed identifier: reject like an unclosed string
+                    return string.Empty;
+                }
+                sb.Append(c == '[' ? "[ID]" : "\"ID\"");
+                i = end;
+                continue;
+            }
 
             // 1. Single line comment: --
             if (c == '-' && i + 1 < len && sql[i + 1] == '-')
@@ -359,81 +407,7 @@ public class GuardrailsValidator
                 continue;
             }
 
-            // 6. Bracketed identifier: [...] (supports escaped closing bracket ]])
-            if (c == '[')
-            {
-                sb.Append('[');
-                i++;
-                bool closed = false;
-                while (i < len)
-                {
-                    char ch = sql[i];
-                    if (ch == ']')
-                    {
-                        // Escaped closing bracket ]]
-                        if (i + 1 < len && sql[i + 1] == ']')
-                        {
-                            sb.Append("]]");
-                            i += 2;
-                            continue;
-                        }
-
-                        closed = true;
-                        sb.Append(']');
-                        i++;
-                        break;
-                    }
-
-                    sb.Append(ch);
-                    i++;
-                }
-
-                if (!closed)
-                {
-                    hasUnclosedString = true;
-                    return string.Empty;
-                }
-                continue;
-            }
-
-            // 7. Double-quoted identifier: "..." (supports escaped double quote "")
-            if (c == '"')
-            {
-                sb.Append('"');
-                i++;
-                bool closed = false;
-                while (i < len)
-                {
-                    char ch = sql[i];
-                    if (ch == '"')
-                    {
-                        // Escaped double quote ""
-                        if (i + 1 < len && sql[i + 1] == '"')
-                        {
-                            sb.Append("\"\"");
-                            i += 2;
-                            continue;
-                        }
-
-                        closed = true;
-                        sb.Append('"');
-                        i++;
-                        break;
-                    }
-
-                    sb.Append(ch);
-                    i++;
-                }
-
-                if (!closed)
-                {
-                    hasUnclosedString = true;
-                    return string.Empty;
-                }
-                continue;
-            }
-
-            // 8. Regular character
+            // 6. Regular character
             sb.Append(c);
             i++;
         }
