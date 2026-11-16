@@ -35,12 +35,15 @@ public class GuardrailsValidator
         }) + @")\b",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
+    private const string IdentifierPartPattern =
+        @"(?:\[(?:[^\]\r\n]|\]\])+\]|""(?:[^""\r\n]|"""")+""|[a-zA-Z_#@$][a-zA-Z0-9_#@$]*)";
+
     private static readonly Regex FourPartNameRegex = new(
         @"(?:\b|(?=[\[""]))" +
-        @"(?:\[[^\]\r\n]+\]|""[^""\r\n]+""|[a-zA-Z_#@$][a-zA-Z0-9_#@$]*)" +
-        @"(?:\s*\.\s*(?:\[[^\]\r\n]+\]|""[^""\r\n]+""|[a-zA-Z_#@$][a-zA-Z0-9_#@$]*)?){2,}" +
+        IdentifierPartPattern +
+        @"(?:\s*\.\s*" + IdentifierPartPattern + @"?){2,}" +
         @"\s*\.\s*" +
-        @"(?:\[[^\]\r\n]+\]|""[^""\r\n]+""|[a-zA-Z_#@$][a-zA-Z0-9_#@$]*)" +
+        IdentifierPartPattern +
         @"(?:\b|(?<=[\]""]))",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
@@ -100,10 +103,34 @@ public class GuardrailsValidator
         for (int i = 0; i < identifier.Length; i++)
         {
             char c = identifier[i];
-            if (c == '[' && !inQuote) inBracket = true;
-            else if (c == ']' && inBracket) inBracket = false;
-            else if (c == '"' && !inBracket) inQuote = !inQuote;
-            else if (c == '.' && !inBracket && !inQuote) count++;
+            if (c == '[' && !inQuote && !inBracket)
+            {
+                inBracket = true;
+            }
+            else if (c == ']' && inBracket)
+            {
+                // Check for escaped closing bracket ]]
+                if (i + 1 < identifier.Length && identifier[i + 1] == ']')
+                {
+                    i++;
+                    continue;
+                }
+                inBracket = false;
+            }
+            else if (c == '"' && !inBracket)
+            {
+                // Check for escaped double quote ""
+                if (inQuote && i + 1 < identifier.Length && identifier[i + 1] == '"')
+                {
+                    i++;
+                    continue;
+                }
+                inQuote = !inQuote;
+            }
+            else if (c == '.' && !inBracket && !inQuote)
+            {
+                count++;
+            }
         }
         return count;
     }
@@ -180,7 +207,7 @@ public class GuardrailsValidator
         string strippedSql = StripCommentsAndStrings(query, out bool hasUnclosedString, out bool hasMultipleStatements);
 
         if (hasUnclosedString)
-            return QuerySafetyResult.Unsafe("Query has unclosed string literals.");
+            return QuerySafetyResult.Unsafe("Query has unclosed string literals or delimited identifiers.");
 
         if (hasMultipleStatements)
             return QuerySafetyResult.Unsafe("Stacked queries and multiple statements separated by ';' are prohibited.");
@@ -222,7 +249,9 @@ public class GuardrailsValidator
     }
 
     /// <summary>
-    /// Helper to remove comments (-- and /* */) and replace string literals ('...') with a safe placeholder.
+    /// Helper to remove comments (-- and /* */), replace string literals ('...') with a safe placeholder,
+    /// and preserve delimited identifiers ([...] and "...") so that subsequent guardrails (4-part names,
+    /// hazardous keywords) correctly inspect the query structure without being bypassed by characters inside identifiers.
     /// Also detects semicolons separating statements.
     /// </summary>
     private static string StripCommentsAndStrings(string sql, out bool hasUnclosedString, out bool hasMultipleStatements)
@@ -239,7 +268,68 @@ public class GuardrailsValidator
         {
             char c = sql[i];
 
-            // String literal: '...'
+            // 1. Single line comment: --
+            if (c == '-' && i + 1 < len && sql[i + 1] == '-')
+            {
+                i += 2;
+                while (i < len && sql[i] != '\n' && sql[i] != '\r')
+                {
+                    i++;
+                }
+                sb.Append(' ');
+                continue;
+            }
+
+            // 2. Block comment: /* ... */ (supports nested block comments in T-SQL)
+            if (c == '/' && i + 1 < len && sql[i + 1] == '*')
+            {
+                int commentDepth = 1;
+                i += 2;
+                while (i < len && commentDepth > 0)
+                {
+                    if (sql[i] == '/' && i + 1 < len && sql[i + 1] == '*')
+                    {
+                        commentDepth++;
+                        i += 2;
+                    }
+                    else if (sql[i] == '*' && i + 1 < len && sql[i + 1] == '/')
+                    {
+                        commentDepth--;
+                        i += 2;
+                    }
+                    else
+                    {
+                        i++;
+                    }
+                }
+
+                if (commentDepth > 0)
+                {
+                    hasUnclosedString = true;
+                    return string.Empty;
+                }
+
+                sb.Append(' ');
+                continue;
+            }
+
+            // 3. Statement separator ;
+            if (c == ';')
+            {
+                foundSemicolon = true;
+                sb.Append(' ');
+                i++;
+                continue;
+            }
+
+            // 4. Check for multiple statements: non-whitespace token encountered after a semicolon
+            if (foundSemicolon && !char.IsWhiteSpace(c))
+            {
+                hasMultipleStatements = true;
+                break;
+            }
+
+            // 5. String literal: '...'
             if (c == '\'')
             {
                 sb.Append("'STR'");
@@ -269,51 +359,81 @@ public class GuardrailsValidator
                 continue;
             }
 
-            // Single line comment: --
-            if (c == '-' && i + 1 < len && sql[i + 1] == '-')
+            // 6. Bracketed identifier: [...] (supports escaped closing bracket ]])
+            if (c == '[')
             {
-                i += 2;
-                while (i < len && sql[i] != '\n' && sql[i] != '\r')
-                {
-                    i++;
-                }
-                sb.Append(' ');
-                continue;
-            }
-
-            // Block comment: /* ... */
-            if (c == '/' && i + 1 < len && sql[i + 1] == '*')
-            {
-                i += 2;
+                sb.Append('[');
+                i++;
+                bool closed = false;
                 while (i < len)
                 {
-                    if (sql[i] == '*' && i + 1 < len && sql[i + 1] == '/')
+                    char ch = sql[i];
+                    if (ch == ']')
                     {
-                        i += 2;
+                        // Escaped closing bracket ]]
+                        if (i + 1 < len && sql[i + 1] == ']')
+                        {
+                            sb.Append("]]");
+                            i += 2;
+                            continue;
+                        }
+
+                        closed = true;
+                        sb.Append(']');
+                        i++;
                         break;
                     }
+
+                    sb.Append(ch);
                     i++;
                 }
-                sb.Append(' ');
+
+                if (!closed)
+                {
+                    hasUnclosedString = true;
+                    return string.Empty;
+                }
                 continue;
             }
 
-            // Check statement separator ;
-            if (c == ';')
+            // 7. Double-quoted identifier: "..." (supports escaped double quote "")
+            if (c == '"')
             {
-                foundSemicolon = true;
-                sb.Append(' ');
+                sb.Append('"');
                 i++;
+                bool closed = false;
+                while (i < len)
+                {
+                    char ch = sql[i];
+                    if (ch == '"')
+                    {
+                        // Escaped double quote ""
+                        if (i + 1 < len && sql[i + 1] == '"')
+                        {
+                            sb.Append("\"\"");
+                            i += 2;
+                            continue;
+                        }
+
+                        closed = true;
+                        sb.Append('"');
+                        i++;
+                        break;
+                    }
+
+                    sb.Append(ch);
+                    i++;
+                }
+
+                if (!closed)
+                {
+                    hasUnclosedString = true;
+                    return string.Empty;
+                }
                 continue;
             }
 
-            // If a semicolon was previously encountered and we see non-whitespace, that's multiple statements!
-            if (foundSemicolon && !char.IsWhiteSpace(c))
-            {
-                hasMultipleStatements = true;
-                break;
-            }
-
+            // 8. Regular character
             sb.Append(c);
             i++;
         }

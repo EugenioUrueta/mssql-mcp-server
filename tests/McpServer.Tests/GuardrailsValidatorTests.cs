@@ -279,4 +279,155 @@ public class GuardrailsValidatorTests
         var ex = Assert.Throws<SecurityException>(() => _validator.ValidateTable(tableName));
         Assert.Contains("Four-part object identifiers", ex.Message, StringComparison.OrdinalIgnoreCase);
     }
+
+    [Theory]
+    [InlineData("SELECT [x'].* FROM remote_srv.db.dbo.users AS [x']")]
+    [InlineData("SELECT [x'].* FROM [remote_srv].[db].[dbo].[users] AS [x']")]
+    [InlineData("SELECT [x'].[id], [x'].[name] FROM remote_srv.remote_db.dbo.orders AS [x']")]
+    [InlineData("SELECT [x'].* FROM remote_srv.db..users AS [x']")]
+    [InlineData("SELECT [x'].* FROM remote_srv...users AS [x']")]
+    [InlineData("SELECT a.[col'] FROM local_table a INNER JOIN remote_srv.db.dbo.users b ON a.id = b.id")]
+    [InlineData("SELECT [x'].* FROM [link_srv].[catalog_db].[dbo].[invoices] AS [x']")]
+    public void ValidateReadQuery_ShouldReject_FourPartNames_EvenWithApostropheInBracketedIdentifiers(string sql)
+    {
+        var result = _validator.ValidateReadQuery(sql);
+        Assert.False(result.IsSafe, $"Query '{sql}' should have been rejected for four-part identifiers.");
+        Assert.Contains("strictly prohibited by security guardrails", result.ErrorMessage, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("Four-part object identifiers", result.ErrorMessage, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData("SELECT [\"y\"].* FROM remote_srv.db.dbo.users AS [\"y\"]")]
+    [InlineData("SELECT \"y\".* FROM remote_srv.db.dbo.users AS \"y\"")]
+    [InlineData("SELECT \"x'\".* FROM remote_srv.db.dbo.users AS \"x'\"")]
+    [InlineData("SELECT * FROM \"remote_srv\".\"db\".\"dbo\".\"users\" AS [\"y\"]")]
+    [InlineData("SELECT * FROM [remote_srv].[db].[dbo].[users] AS \"y\"")]
+    public void ValidateReadQuery_ShouldReject_FourPartNames_WithQuotedOrBracketedIdentifiers(string sql)
+    {
+        var result = _validator.ValidateReadQuery(sql);
+        Assert.False(result.IsSafe, $"Query '{sql}' should have been rejected for four-part identifiers.");
+        Assert.Contains("Four-part object identifiers", result.ErrorMessage, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData("SELECT [x'].[id] FROM local_table AS [x']")]
+    [InlineData("SELECT [x'].* FROM local_table AS [x']")]
+    [InlineData("SELECT [customer's_id], [order's_total] FROM local_table")]
+    [InlineData("SELECT [it's_a_column] FROM dbo.orders")]
+    [InlineData("SELECT [a'b].[col'c] FROM [local_table] AS [a'b]")]
+    [InlineData("SELECT \"col'name\" FROM \"local_table\"")]
+    public void ValidateReadQuery_ShouldAllow_SafeQueries_WithApostrophesInDelimitedIdentifiers(string sql)
+    {
+        var result = _validator.ValidateReadQuery(sql);
+        Assert.True(result.IsSafe, $"Query '{sql}' was unexpectedly rejected: {result.ErrorMessage}");
+    }
+
+    [Theory]
+    [InlineData("SELECT [foo]]bar] FROM local_table")]
+    [InlineData("SELECT [col]]name], [other]]col] FROM dbo.local_table")]
+    [InlineData("SELECT [[foo]]bar] FROM local_table")]
+    [InlineData("SELECT [[[foo]]bar]]] FROM local_table")]
+    [InlineData("SELECT \"foo\"\"bar\" FROM local_table")]
+    [InlineData("SELECT [my]]table].[col]]name] FROM [my]]db].[dbo].[my]]table]")]
+    public void ValidateReadQuery_ShouldAllow_DelimitedIdentifiers_WithEscapedBracketsOrQuotes(string sql)
+    {
+        var result = _validator.ValidateReadQuery(sql);
+        Assert.True(result.IsSafe, $"Query '{sql}' was unexpectedly rejected: {result.ErrorMessage}");
+    }
+
+    [Theory]
+    [InlineData("SELECT * FROM [remote]]srv].[db].[dbo].[users]")]
+    [InlineData("SELECT * FROM \"remote\"\"srv\".\"db\".\"dbo\".\"users\"")]
+    [InlineData("SELECT * FROM [remote_srv].[db].[dbo].[[foo]]bar]]]")]
+    [InlineData("SELECT [col] FROM [remote]]srv]...[users]")]
+    public void ValidateReadQuery_ShouldReject_FourPartNames_WithEscapedBracketsOrQuotes(string sql)
+    {
+        var result = _validator.ValidateReadQuery(sql);
+        Assert.False(result.IsSafe, $"Query '{sql}' should have been rejected for four-part identifiers.");
+        Assert.Contains("Four-part object identifiers", result.ErrorMessage, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData("SELECT [[foo]]bar]] FROM local_table")]
+    [InlineData("SELECT [unclosed_col FROM local_table")]
+    [InlineData("SELECT \"unclosed_col FROM local_table")]
+    [InlineData("SELECT [escaped]]unclosed FROM local_table")]
+    [InlineData("SELECT \"escaped\"\"unclosed FROM local_table")]
+    public void ValidateReadQuery_ShouldReject_UnclosedDelimitedIdentifiers(string sql)
+    {
+        var result = _validator.ValidateReadQuery(sql);
+        Assert.False(result.IsSafe, $"Query '{sql}' should have been rejected for unclosed identifier.");
+        Assert.Contains("unclosed", result.ErrorMessage, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData("[remote]]srv].[db].[dbo].[users]")]
+    [InlineData("\"remote\"\"srv\".\"db\".\"dbo\".\"users\"")]
+    [InlineData("[link_srv].[db].[dbo].[[foo]]bar]]]")]
+    public void ValidateNoFourPartIdentifier_ShouldThrow_ForFourPartIdentifiers_WithEscapedDelimiters(string identifier)
+    {
+        var ex = Assert.Throws<SecurityException>(() => _validator.ValidateNoFourPartIdentifier(identifier, "Object"));
+        Assert.Contains("Four-part object identifiers", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData("[[foo]]bar]]")]
+    [InlineData("[foo]]bar]")]
+    [InlineData("[[foo]]bar]")]
+    [InlineData("\"foo\"\"bar\"")]
+    [InlineData("[local]]db].[dbo].[local]]table]")]
+    public void ValidateNoFourPartIdentifier_ShouldAllow_SafeIdentifiers_WithEscapedDelimiters(string identifier)
+    {
+        // Should not throw
+        _validator.ValidateNoFourPartIdentifier(identifier, "Object");
+    }
+
+    [Theory]
+    [InlineData("SELECT [table--name].* FROM [table--name]")]
+    [InlineData("SELECT [col--1], [col/*test*/2] FROM local_table")]
+    [InlineData("SELECT [table--name].[id] FROM [table--name]")]
+    public void ValidateReadQuery_ShouldAllow_DelimitedIdentifiers_WithCommentsInside(string sql)
+    {
+        var result = _validator.ValidateReadQuery(sql);
+        Assert.True(result.IsSafe, $"Query '{sql}' was unexpectedly rejected: {result.ErrorMessage}");
+    }
+
+    [Fact]
+    public void ValidateReadQuery_ShouldReject_FourPartName_WithCommentInsideDelimitedIdentifier()
+    {
+        string sql = "SELECT [table--name].* FROM remote_srv.db.dbo.[table--name]";
+        var result = _validator.ValidateReadQuery(sql);
+        Assert.False(result.IsSafe);
+        Assert.Contains("Four-part object identifiers", result.ErrorMessage, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData("/* /* inner */ outer */ SELECT * FROM local_table")]
+    [InlineData("SELECT /* /* level 2 */ level 1 */ id FROM local_table")]
+    [InlineData("/* /* level 2 /* level 3 */ level 2 */ level 1 */ SELECT * FROM orders")]
+    [InlineData("SELECT 1 /* comment /* nested */ */")]
+    public void ValidateReadQuery_ShouldAllow_NestedBlockComments(string sql)
+    {
+        var result = _validator.ValidateReadQuery(sql);
+        Assert.True(result.IsSafe, $"Query '{sql}' was unexpectedly rejected: {result.ErrorMessage}");
+    }
+
+    [Theory]
+    [InlineData("/* /* inner */ SELECT * FROM local_table")]
+    [InlineData("/* /* level 2 /* level 3 */ level 2 */ SELECT * FROM orders")]
+    public void ValidateReadQuery_ShouldReject_UnclosedNestedBlockComments(string sql)
+    {
+        var result = _validator.ValidateReadQuery(sql);
+        Assert.False(result.IsSafe, $"Query '{sql}' should have been rejected for unclosed block comment.");
+        Assert.Contains("unclosed", result.ErrorMessage, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void ValidateReadQuery_ShouldReject_HazardousCommand_EvenIfDisguisedWithNestedComments()
+    {
+        string sql = "/* /* inner */ outer */ DROP TABLE local_table";
+        var result = _validator.ValidateReadQuery(sql);
+        Assert.False(result.IsSafe);
+        Assert.Contains("DROP", result.ErrorMessage);
+    }
 }
