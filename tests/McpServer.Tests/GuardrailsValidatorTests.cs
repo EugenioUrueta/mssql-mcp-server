@@ -76,7 +76,7 @@ public class GuardrailsValidatorTests
     [Theory]
     [InlineData("Clientes")]
     [InlineData("dbo.Articulos")]
-    [InlineData("[dbo].[fac_facturas]")]
+    [InlineData("[dbo].[BillingInvoices]")]
     [InlineData("OrderDetails")]
     [InlineData("InvoiceLines")]
     public void ValidateTable_ShouldAllow_SafeTables(string tableName)

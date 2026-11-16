@@ -258,10 +258,10 @@ public class ToolExecutionTests
 
     [Theory]
     [InlineData("orders", "%orders%")]
-    [InlineData("inv_*", "inv_%")]
+    [InlineData("prod_*", "prod_%")]
     [InlineData("*customers*", "%customers%")]
     [InlineData("%orders%", "%orders%")]
-    [InlineData("car_%", "car_%")]
+    [InlineData("cust_%", "cust_%")]
     [InlineData("%detail", "%detail")]
     [InlineData("table*name", "table%name")]
     public void SearchObjectsTool_NormalizePattern_CorrectlyHandlesVariousWildcards(string input, string expected)
@@ -274,9 +274,9 @@ public class ToolExecutionTests
     }
 
     [Theory]
-    [InlineData("""{"pattern": "orders, inv_* | car_%"}""")]
-    [InlineData("""{"patterns": ["orders", "inv_*", "%car%"]}""")]
-    [InlineData("""{"pattern": "orders, items", "patterns": ["inv_*"]}""")]
+    [InlineData("""{"pattern": "orders, prod_* | cust_%"}""")]
+    [InlineData("""{"patterns": ["orders", "prod_*", "%cust%"]}""")]
+    [InlineData("""{"pattern": "orders, items", "patterns": ["prod_*"]}""")]
     public async Task SearchObjectsTool_NormalizesAndValidatesPatterns_ProceedsPastValidation(string argsJson)
     {
         var tool = new SearchObjectsTool(_connectionManager, _validator);
@@ -324,11 +324,11 @@ public class ToolExecutionTests
     [Theory]
     [InlineData("main_orders", "main")]
     [InlineData("MAIN_CUSTOMERS", "main")]
-    [InlineData("car_recibos_nc", "car")]
-    [InlineData("CAR_PAGOS", "car")]
-    [InlineData("gen_articulos", "gen")]
-    [InlineData("tes_egresos", "tes")]
-    [InlineData("base_empresas", "base")]
+    [InlineData("billing_invoices", "billing")]
+    [InlineData("BILLING_PAYMENTS", "billing")]
+    [InlineData("catalog_items", "catalog")]
+    [InlineData("fin_expenses", "fin")]
+    [InlineData("core_companies", "core")]
     [InlineData("Clientes", "general")]
     [InlineData("usuarios", "general")]
     [InlineData("_temp_table", "general")]
@@ -460,9 +460,9 @@ public class ToolExecutionTests
 
     [Theory]
     [InlineData("""{"search": "orders"}""")]
-    [InlineData("""{"search": "orders, inv_* | car_%"}""")]
+    [InlineData("""{"search": "orders, prod_* | cust_%"}""")]
     [InlineData("""{"query": "customers"}""")]
-    [InlineData("""{"query": "inv_*, car_*"}""")]
+    [InlineData("""{"query": "prod_*, cust_*"}""")]
     public async Task SearchObjectsTool_AcceptsSearchAndQueryAliases(string argsJson)
     {
         var tool = new SearchObjectsTool(_connectionManager, _validator);
@@ -678,11 +678,11 @@ public class ToolExecutionTests
     }
 
     [Theory]
-    [InlineData("""{"pattern": "gen_%"}""")]
-    [InlineData("""{"patterns": ["gen_%", "car_%"]}""")]
-    [InlineData("""{"search": "inv_*"}""")]
-    [InlineData("""{"query": "dbo.gen_articulos"}""")]
-    [InlineData("""{"pattern": "gen_%, car_%"}""")]
+    [InlineData("""{"pattern": "usp_%"}""")]
+    [InlineData("""{"patterns": ["usp_%", "sales_%"]}""")]
+    [InlineData("""{"search": "prod_*"}""")]
+    [InlineData("""{"query": "dbo.usp_get_items"}""")]
+    [InlineData("""{"pattern": "usp_%, sales_%"}""")]
     public async Task GetProcedureSignaturesTool_AcceptsPatternAliases_ProceedsPastValidation(string argsJson)
     {
         var tool = new GetProcedureSignaturesTool(_connectionManager, _validator);
@@ -696,15 +696,15 @@ public class ToolExecutionTests
     }
 
     [Theory]
-    [InlineData("""{"sp_name": "dbo.gen_articulos_get"}""")]
-    [InlineData("""{"sp_names": ["gen_articulos_get", "car_recibos_get"]}""")]
-    [InlineData("""{"procedure_name": "dbo.gen_articulos_get"}""")]
-    [InlineData("""{"procedure_names": ["gen_articulos_get"]}""")]
-    [InlineData("""{"procedures": ["gen_articulos_get"]}""")]
-    [InlineData("""{"procedure": "dbo.gen_articulos_get"}""")]
-    [InlineData("""{"names": ["dbo.gen_articulos_get"]}""")]
-    [InlineData("""{"name": "gen_articulos_get"}""")]
-    [InlineData("""{"sp_name": "gen_articulos_get, car_recibos_get"}""")]
+    [InlineData("""{"sp_name": "dbo.usp_get_items"}""")]
+    [InlineData("""{"sp_names": ["usp_get_items", "usp_get_orders"]}""")]
+    [InlineData("""{"procedure_name": "dbo.usp_get_items"}""")]
+    [InlineData("""{"procedure_names": ["usp_get_items"]}""")]
+    [InlineData("""{"procedures": ["usp_get_items"]}""")]
+    [InlineData("""{"procedure": "dbo.usp_get_items"}""")]
+    [InlineData("""{"names": ["dbo.usp_get_items"]}""")]
+    [InlineData("""{"name": "usp_get_items"}""")]
+    [InlineData("""{"sp_name": "usp_get_items, usp_get_orders"}""")]
     public async Task GetProcedureSignaturesTool_AcceptsProcedureNameAliases_ProceedsPastValidation(string argsJson)
     {
         var tool = new GetProcedureSignaturesTool(_connectionManager, _validator);

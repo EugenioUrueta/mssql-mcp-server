@@ -78,7 +78,7 @@ public class GetProcedureSignaturesTool : IMcpToolHandler
                 pattern = new
                 {
                     type = "string",
-                    description = "Search pattern for procedure names (e.g. 'gen_%', 'car_recibos%'). Supports comma/pipe separation. Aliases: 'patterns', 'search', 'query'."
+                    description = "Search pattern for procedure names (e.g. 'usp_%', 'sales_%'). Supports comma/pipe separation. Aliases: 'patterns', 'search', 'query'."
                 },
                 patterns = new
                 {

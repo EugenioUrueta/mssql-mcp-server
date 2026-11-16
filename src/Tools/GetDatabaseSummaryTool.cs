@@ -31,7 +31,7 @@ public class GetDatabaseSummaryTool : IMcpToolHandler
     public McpToolDefinition Definition => new()
     {
         Name = "get_database_summary",
-        Description = "Provides an executive summary of the active or specified database: groups tables by functional module prefix (e.g. main_*, gen_*, car_*, tes_*), computes total and per-module row counts and table counts, and reports last modification dates.",
+        Description = "Provides an executive summary of the active or specified database: groups tables by functional module prefix (e.g. auth_*, billing_*, catalog_*, orders_*), computes total and per-module row counts and table counts, and reports last modification dates.",
         InputSchema = new
         {
             type = "object",

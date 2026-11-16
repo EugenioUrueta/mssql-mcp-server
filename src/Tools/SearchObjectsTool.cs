@@ -34,7 +34,7 @@ public class SearchObjectsTool : IMcpToolHandler
                 pattern = new
                 {
                     type = "string",
-                    description = "Search pattern (e.g. '%orders%', 'inv_%', 'Customers'). Supports comma/pipe separation for multiple patterns. Aliases: 'search', 'query'."
+                    description = "Search pattern (e.g. '%orders%', 'catalog_%', 'Customers'). Supports comma/pipe separation for multiple patterns. Aliases: 'search', 'query'."
                 },
                 patterns = new
                 {
