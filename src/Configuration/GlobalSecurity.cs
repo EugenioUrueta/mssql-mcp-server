@@ -45,8 +45,17 @@ public class GlobalSecurity
         "*Clave*",
         "*Passw*",
         "*Contrasen*",
-        "*Pin*"
+        "*Pin*",
+        "*Conexion*",
+        "*Connection*",
+        "*ConnectionString*",
+        "*CadenaConexion*"
     };
+
+    /// <summary>
+    /// Whether to prohibit four-part object identifiers (linked server references).
+    /// </summary>
+    public bool ProhibitFourPartNames { get; set; } = true;
 
     /// <summary>
     /// Maximum rows allowed to be returned by any query.

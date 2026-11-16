@@ -50,9 +50,10 @@ public class ToolExecutionTests
             {
                 DeniedDatabases = new List<string> { "master", "tempdb" },
                 DeniedTables = new List<string> { "*Password*", "*Token*", "*Session*" },
-                DeniedColumns = new List<string> { "*Password*", "*Hash*" },
+                DeniedColumns = new List<string> { "*Password*", "*Hash*", "*Conexion*", "*Connection*", "*ConnectionString*", "*CadenaConexion*" },
                 MaxRowsLimit = 200,
-                DefaultTimeoutSeconds = 15
+                DefaultTimeoutSeconds = 15,
+                ProhibitFourPartNames = true
             }
         };
 
@@ -1090,5 +1091,177 @@ public class ToolExecutionTests
         Assert.True(result.IsError);
         Assert.DoesNotContain("parameter is required", result.Content[0].Text, StringComparison.OrdinalIgnoreCase);
         Assert.Contains("Error searching database objects", result.Content[0].Text, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task ExecuteSpTool_RejectsExecution_WhenDisabledByDefault()
+    {
+        var settings = new InstanceSettings
+        {
+            DefaultProfile = "default-profile",
+            Profiles =
+            {
+                ["default-profile"] = new ProfileConfig
+                {
+                    Description = "Profile with default security flags",
+                    ConnectionString = "Server=localhost;Database=DB_Test_Dev;User Id=sa;Password=secret;",
+                    DefaultDatabase = "DB_Test_Dev"
+                    // AllowExecuteSp = false and AllowSimulation = false by default
+                }
+            }
+        };
+        var session = new SessionContext(settings);
+        var validator = new GuardrailsValidator(settings.Security);
+        var connMgr = new InstanceConnectionManager(settings, session, validator);
+        var tool = new ExecuteSpTool(connMgr, validator);
+
+        string argsJson = """
+        {
+            "sp_name": "usp_get_customer_orders",
+            "simulate": false
+        }
+        """;
+
+        using var doc = JsonDocument.Parse(argsJson);
+        var result = await tool.ExecuteAsync(doc.RootElement);
+
+        Assert.True(result.IsError);
+        Assert.Contains("Stored procedure execution is disabled by default on profile", result.Content[0].Text, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("allowExecuteSp: true", result.Content[0].Text, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task ExecuteSpTool_RejectsSimulation_WhenSimulationDisabledByDefault()
+    {
+        var settings = new InstanceSettings
+        {
+            DefaultProfile = "default-profile",
+            Profiles =
+            {
+                ["default-profile"] = new ProfileConfig
+                {
+                    Description = "Profile with default security flags",
+                    ConnectionString = "Server=localhost;Database=DB_Test_Dev;User Id=sa;Password=secret;",
+                    DefaultDatabase = "DB_Test_Dev"
+                    // AllowExecuteSp = false and AllowSimulation = false by default
+                }
+            }
+        };
+        var session = new SessionContext(settings);
+        var validator = new GuardrailsValidator(settings.Security);
+        var connMgr = new InstanceConnectionManager(settings, session, validator);
+        var tool = new ExecuteSpTool(connMgr, validator);
+
+        string argsJson = """
+        {
+            "sp_name": "usp_get_customer_orders",
+            "simulate": true
+        }
+        """;
+
+        using var doc = JsonDocument.Parse(argsJson);
+        var result = await tool.ExecuteAsync(doc.RootElement);
+
+        Assert.True(result.IsError);
+        Assert.Contains("Stored procedure simulation is disabled by default on profile", result.Content[0].Text, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("allowSimulation: true", result.Content[0].Text, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData("""{"sp_name": "[LINKED_SRV].[RemoteDb].[dbo].[RemoteSp]"}""")]
+    [InlineData("""{"procedure_name": "RemoteServer.FinanceDb.dbo.usp_SyncData"}""")]
+    [InlineData("""{"sp": "RemoteServer...usp_Test"}""")]
+    public async Task ExecuteSpTool_RejectsExecution_WhenFourPartSpNameProvided(string argsJson)
+    {
+        var tool = new ExecuteSpTool(_connectionManager, _validator);
+
+        using var doc = JsonDocument.Parse(argsJson);
+        var result = await tool.ExecuteAsync(doc.RootElement);
+
+        Assert.True(result.IsError);
+        Assert.Contains("Four-part object identifiers", result.Content[0].Text, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("strictly prohibited by security guardrails", result.Content[0].Text, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData("""{"table_name": "[LINKED_SRV].[RemoteDb].[dbo].[RemoteInvoices]"}""")]
+    [InlineData("""{"table_name": "RemoteServer.FinanceDb.dbo.Customers"}""")]
+    [InlineData("""{"table_names": ["dbo.Invoices", "[LINKED_SRV]...[RemoteInvoices]"]}""")]
+    public async Task GetTableSchemaTool_RejectsExecution_WhenFourPartTableNameProvided(string argsJson)
+    {
+        var tool = new GetTableSchemaTool(_connectionManager, _validator);
+
+        using var doc = JsonDocument.Parse(argsJson);
+        var result = await tool.ExecuteAsync(doc.RootElement);
+
+        Assert.True(result.IsError);
+        Assert.Contains("Four-part object identifiers", result.Content[0].Text, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("strictly prohibited by security guardrails", result.Content[0].Text, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData("""{"sp_name": "[LINKED_SRV].[RemoteDb].[dbo].[RemoteSp]"}""")]
+    [InlineData("""{"sp_names": ["RemoteServer.FinanceDb.dbo.usp_SyncData"]}""")]
+    public async Task GetSpDefinitionTool_RejectsExecution_WhenFourPartSpNameProvided(string argsJson)
+    {
+        var tool = new GetSpDefinitionTool(_connectionManager, _validator);
+
+        using var doc = JsonDocument.Parse(argsJson);
+        var result = await tool.ExecuteAsync(doc.RootElement);
+
+        Assert.True(result.IsError);
+        Assert.Contains("Four-part object identifiers", result.Content[0].Text, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("strictly prohibited by security guardrails", result.Content[0].Text, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData("""{"sp_name": "[LINKED_SRV].[RemoteDb].[dbo].[RemoteSp]"}""")]
+    [InlineData("""{"pattern": "[LINKED_SRV].[RemoteDb].[dbo].[usp_%]"}""")]
+    [InlineData("""{"patterns": ["RemoteServer.FinanceDb.dbo.%"]}""")]
+    public async Task GetProcedureSignaturesTool_RejectsExecution_WhenFourPartSpNameOrPatternProvided(string argsJson)
+    {
+        var tool = new GetProcedureSignaturesTool(_connectionManager, _validator);
+
+        using var doc = JsonDocument.Parse(argsJson);
+        var result = await tool.ExecuteAsync(doc.RootElement);
+
+        Assert.True(result.IsError);
+        Assert.Contains("Four-part object identifiers", result.Content[0].Text, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("strictly prohibited by security guardrails", result.Content[0].Text, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData("SELECT * FROM [LINKED_SRV].[RemoteDb].[dbo].[RemoteInvoices]")]
+    [InlineData("SELECT * FROM RemoteServer.FinanceDb.dbo.Customers")]
+    [InlineData("SELECT * FROM (SELECT * FROM [LINKED_SRV].[RemoteDb].[dbo].[RemoteInvoices]) sub")]
+    public async Task ReadQueryTool_RejectsExecution_WhenFourPartNameInQuery(string sql)
+    {
+        var tool = new ReadQueryTool(_connectionManager, _validator, _settings.Security);
+
+        string argsJson = $$"""
+        {
+            "query": "{{sql}}"
+        }
+        """;
+
+        using var doc = JsonDocument.Parse(argsJson);
+        var result = await tool.ExecuteAsync(doc.RootElement);
+
+        Assert.True(result.IsError);
+        Assert.Contains("Four-part object identifiers", result.Content[0].Text, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("strictly prohibited by security guardrails", result.Content[0].Text, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData("Conexion", true)]
+    [InlineData("CadenaConexion", true)]
+    [InlineData("ConnectionString", true)]
+    [InlineData("ServerConnection", true)]
+    [InlineData("Remote_CadenaConexion_Db", true)]
+    [InlineData("CodigoArticulo", false)]
+    public void ReadQueryTool_MasksConnectionColumnsInResults(string columnName, bool expectedDenied)
+    {
+        bool isDenied = _validator.IsColumnDenied(columnName);
+        Assert.Equal(expectedDenied, isDenied);
     }
 }

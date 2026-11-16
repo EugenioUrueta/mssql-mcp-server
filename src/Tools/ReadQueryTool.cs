@@ -155,86 +155,102 @@ public class ReadQueryTool : IMcpToolHandler
         try
         {
             await using var connection = await _connectionManager.OpenConnectionAsync(profile, database, cancellationToken);
-            await using var cmd = new SqlCommand(rawQuery, connection)
+            var transaction = (SqlTransaction)await connection.BeginTransactionAsync(IsolationLevel.ReadUncommitted, cancellationToken);
+            try
             {
-                CommandTimeout = timeout
-            };
-
-            var objectRows = new List<Dictionary<string, object?>>();
-            var compactRows = new List<List<object?>>();
-            var columnNames = new List<string>();
-            bool truncated = false;
-
-            await using (var reader = await cmd.ExecuteReaderAsync(CommandBehavior.SequentialAccess, cancellationToken))
-            {
-                for (int i = 0; i < reader.FieldCount; i++)
+                await using var cmd = new SqlCommand(rawQuery, connection, transaction)
                 {
-                    columnNames.Add(reader.GetName(i));
+                    CommandTimeout = timeout
+                };
+
+                var objectRows = new List<Dictionary<string, object?>>();
+                var compactRows = new List<List<object?>>();
+                var columnNames = new List<string>();
+                bool truncated = false;
+
+                await using (var reader = await cmd.ExecuteReaderAsync(CommandBehavior.SequentialAccess, cancellationToken))
+                {
+                    for (int i = 0; i < reader.FieldCount; i++)
+                    {
+                        columnNames.Add(reader.GetName(i));
+                    }
+
+                    int rowCount = 0;
+                    while (await reader.ReadAsync(cancellationToken))
+                    {
+                        if (rowCount >= maxRows)
+                        {
+                            truncated = true;
+                            break;
+                        }
+
+                        if (format == "compact")
+                        {
+                            var rowList = new List<object?>(reader.FieldCount);
+                            for (int i = 0; i < reader.FieldCount; i++)
+                            {
+                                string colName = columnNames[i];
+                                if (_validator.IsColumnDenied(colName))
+                                {
+                                    rowList.Add("***RESTRICTED***");
+                                }
+                                else
+                                {
+                                    rowList.Add(reader.IsDBNull(i) ? null : reader.GetValue(i));
+                                }
+                            }
+                            compactRows.Add(rowList);
+                        }
+                        else
+                        {
+                            var rowDict = new Dictionary<string, object?>(reader.FieldCount);
+                            for (int i = 0; i < reader.FieldCount; i++)
+                            {
+                                string colName = columnNames[i];
+                                if (_validator.IsColumnDenied(colName))
+                                {
+                                    rowDict[colName] = "***RESTRICTED***";
+                                }
+                                else
+                                {
+                                    rowDict[colName] = reader.IsDBNull(i) ? null : reader.GetValue(i);
+                                }
+                            }
+                            objectRows.Add(rowDict);
+                        }
+
+                        rowCount++;
+                    }
                 }
 
-                int rowCount = 0;
-                while (await reader.ReadAsync(cancellationToken))
+                int finalRowCount = format == "compact" ? compactRows.Count : objectRows.Count;
+                object dataPayload = format == "compact" ? compactRows : objectRows;
+
+                var result = new
                 {
-                    if (rowCount >= maxRows)
-                    {
-                        truncated = true;
-                        break;
-                    }
+                    database = connection.Database,
+                    format,
+                    rowCount = finalRowCount,
+                    maxRowsEnforced = maxRows,
+                    isTruncated = truncated,
+                    columns = columnNames,
+                    data = dataPayload
+                };
 
-                    if (format == "compact")
-                    {
-                        var rowList = new List<object?>(reader.FieldCount);
-                        for (int i = 0; i < reader.FieldCount; i++)
-                        {
-                            string colName = columnNames[i];
-                            if (_validator.IsColumnDenied(colName))
-                            {
-                                rowList.Add("***RESTRICTED***");
-                            }
-                            else
-                            {
-                                rowList.Add(reader.IsDBNull(i) ? null : reader.GetValue(i));
-                            }
-                        }
-                        compactRows.Add(rowList);
-                    }
-                    else
-                    {
-                        var rowDict = new Dictionary<string, object?>(reader.FieldCount);
-                        for (int i = 0; i < reader.FieldCount; i++)
-                        {
-                            string colName = columnNames[i];
-                            if (_validator.IsColumnDenied(colName))
-                            {
-                                rowDict[colName] = "***RESTRICTED***";
-                            }
-                            else
-                            {
-                                rowDict[colName] = reader.IsDBNull(i) ? null : reader.GetValue(i);
-                            }
-                        }
-                        objectRows.Add(rowDict);
-                    }
-
-                    rowCount++;
-                }
+                return McpToolCallResult.Success(JsonSerializer.Serialize(result, new JsonSerializerOptions { WriteIndented = indent }));
             }
-
-            int finalRowCount = format == "compact" ? compactRows.Count : objectRows.Count;
-            object dataPayload = format == "compact" ? compactRows : objectRows;
-
-            var result = new
+            finally
             {
-                database = connection.Database,
-                format,
-                rowCount = finalRowCount,
-                maxRowsEnforced = maxRows,
-                isTruncated = truncated,
-                columns = columnNames,
-                data = dataPayload
-            };
-
-            return McpToolCallResult.Success(JsonSerializer.Serialize(result, new JsonSerializerOptions { WriteIndented = indent }));
+                try
+                {
+                    await transaction.RollbackAsync(cancellationToken);
+                }
+                catch
+                {
+                    // Rollback might fail if connection closed or broken
+                }
+                await transaction.DisposeAsync();
+            }
         }
         catch (Exception ex)
         {

@@ -68,8 +68,8 @@ tools/mssql-mcp-server/
 | `get_database_summary` | Resumen ejecutivo de la BD agrupado por prefijos de módulo. | `include_empty_tables`, `indent`. | Agrupación modular sin volcado masivo de registros. |
 | `get_sp_definition` | Definición T-SQL, parámetros y dependencias de SPs. | `sp_name`/`sp_names`/aliases, `summary_only`/`compact`, `include_dependencies`. | Modo `summary_only` para evitar explosión de tokens. |
 | `get_procedure_signatures` | Firmas compactas tipadas de parámetros para SPs. | `pattern`/`patterns`, `sp_names`/aliases, `format`, `include_details`. | Compatible con SQL Server 2008+ (`compatibility_level 100+`) vía XML. |
-| `execute_sp` | Ejecución controlada o simulación transaccional (rollback). | `sp_name`, `parameters`, `simulate`. | Bloqueado en perfiles de solo lectura. Modo simulación siempre seguro. |
-| `read_query` | Consultas SQL de solo lectura (SELECT). | `query`, `format` ("objects" o "compact"), `indent`. | Bloquea DDL/DML destructivo (`DROP`, `DELETE`, etc.) y enmascara columnas sensibles. |
+| `execute_sp` | Ejecución controlada o simulación transaccional (rollback). | `sp_name`, `parameters`, `simulate`. | Apagado por defecto (`AllowExecuteSp: false`, `AllowSimulation: false`). Bloqueado en perfiles de solo lectura. |
+| `read_query` | Consultas SQL de solo lectura (SELECT). | `query`, `format` ("objects" o "compact"), `indent`. | Bloquea DDL/DML destructivo (`DROP`, `DELETE`, etc.), bloquea 4-part names, corre bajo transacción `READ UNCOMMITTED` con rollback forzado y enmascara columnas sensibles y de conexión. |
 
 ---
 
@@ -77,9 +77,15 @@ tools/mssql-mcp-server/
 
 1. **Prevención de Modificación Destructiva**:
    - `read_query` bloquea mediante análisis léxico y expresiones regulares cualquier sentencia que contenga `INSERT`, `UPDATE`, `DELETE`, `DROP`, `ALTER`, `TRUNCATE`, `CREATE`, `GRANT`, `REVOKE`, `EXEC`, o `EXECUTE`.
-2. **Enmascaramiento de Datos Sensibles**:
-   - Todo resultado de consulta procesado por `read_query` enmascara automáticamente valores de columnas que coincidan con patrones sensibles tanto en inglés como en español (`*Password*`, `*Token*`, `*Secret*`, `*Hash*`, `*Salt*`, `*Clave*`, `*Passw*`, `*Contrasen*`, `*Pin*`). Los valores son reemplazados por `"***RESTRICTED***"`.
-3. **Compatibilidad SQL Universal**:
+2. **Ejecución en Transacción Aislada con Rollback Forzado (`read_query`)**:
+   - Para garantizar lecturas no bloqueantes y matemáticamente inmunes a mutación de datos accidental, cada consulta de `read_query` se ejecuta dentro de una transacción con nivel de aislamiento `READ UNCOMMITTED`. Al finalizar la lectura, la transacción se aborta incondicionalmente mediante `ROLLBACK` en un bloque `finally`, garantizando cero bloqueos (equivalente a `NOLOCK`) y asegurando que ninguna modificación pueda persistir jamás.
+3. **Prohibición Estricta de Identificadores de Cuatro Partes (Linked Servers)**:
+   - Se prohíbe terminantemente el uso de identificadores de 4 partes (`server.database.schema.object`, `server.db..tbl`, `server...tbl`, `[server].[db].[schema].[tbl]`, `[server]...[tbl]`, etc.) tanto en consultas libres de `read_query` como en los parámetros de objetos de `execute_sp`, `get_table_schema`, `get_sp_definition` y `get_procedure_signatures` (`ProhibitFourPartNames = true`). Esto neutraliza cualquier intento de escape hacia servidores vinculados no autorizados.
+4. **Desactivación de `execute_sp` por Defecto**:
+   - Siguiendo el principio de menor privilegio, la ejecución y simulación de procedimientos almacenados (`execute_sp`) se encuentran desactivadas por defecto en todos los perfiles (`AllowExecuteSp: false`, `AllowSimulation: false`). Para permitir la invocación o simulación en un perfil específico, debe configurarse explícitamente `"AllowExecuteSp": true` y/o `"AllowSimulation": true`.
+5. **Enmascaramiento de Datos Sensibles y Cadenas de Conexión**:
+   - Todo resultado de consulta procesado por `read_query` enmascara automáticamente valores de columnas que coincidan con patrones sensibles tanto en inglés como en español (`*Password*`, `*Token*`, `*Secret*`, `*Hash*`, `*Salt*`, `*Clave*`, `*Passw*`, `*Contrasen*`, `*Pin*`, `*Conexion*`, `*Connection*`, `*ConnectionString*`, `*CadenaConexion*`). Los valores son reemplazados por `"***RESTRICTED***"`.
+6. **Compatibilidad SQL Universal**:
    - Toda introspección que utilice agregación de cadenas debe contemplar bases de datos con `compatibility_level` inferior a 140 (SQL Server 2008 / 2012 / 2014 / 2016), utilizando `FOR XML PATH(''), TYPE).value('.', 'NVARCHAR(MAX)')` en lugar de asumir la disponibilidad de `STRING_AGG`.
 
 ---

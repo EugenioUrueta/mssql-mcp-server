@@ -267,6 +267,31 @@ public class GetProcedureSignaturesTool : IMcpToolHandler
             return McpToolCallResult.Error("At least one parameter ('pattern' or 'sp_names') is required.");
         }
 
+        // Validate procedures and patterns against security guardrails
+        foreach (var sp in spList)
+        {
+            try
+            {
+                _validator.ValidateNoFourPartIdentifier(sp, "Stored procedure");
+            }
+            catch (Exception ex)
+            {
+                return McpToolCallResult.Error($"Security guardrail blocked: {ex.Message}");
+            }
+        }
+
+        foreach (var pat in patternList)
+        {
+            try
+            {
+                _validator.ValidateNoFourPartIdentifier(pat, "Stored procedure");
+            }
+            catch (Exception ex)
+            {
+                return McpToolCallResult.Error($"Security guardrail blocked: {ex.Message}");
+            }
+        }
+
         bool includeDetails = false;
         if (arguments.Value.TryGetProperty("include_details", out var idProp) &&
             (idProp.ValueKind == JsonValueKind.True || idProp.ValueKind == JsonValueKind.False))

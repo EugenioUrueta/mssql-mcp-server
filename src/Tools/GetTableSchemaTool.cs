@@ -215,6 +215,7 @@ WHERE s.name = @SchemaName AND t.name = @TableName AND i.is_primary_key = 0 AND 
         {
             try
             {
+                _validator.ValidateNoFourPartIdentifier(rawTable, "Table");
                 _validator.ValidateTable(rawTable);
             }
             catch (Exception ex)

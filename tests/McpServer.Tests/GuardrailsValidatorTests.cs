@@ -18,7 +18,8 @@ public class GuardrailsValidatorTests
         {
             DeniedDatabases = new List<string> { "master", "msdb", "tempdb", "model" },
             DeniedTables = new List<string> { "*Password*", "*Token*", "*Secret*", "*Session*", "*Credential*" },
-            DeniedColumns = new List<string> { "*Password*", "*Token*", "*Secret*", "*Hash*", "*Salt*" }
+            DeniedColumns = new List<string> { "*Password*", "*Token*", "*Secret*", "*Hash*", "*Salt*", "*Conexion*", "*Connection*", "*ConnectionString*", "*CadenaConexion*" },
+            ProhibitFourPartNames = true
         };
         _validator = new GuardrailsValidator(_security);
     }
@@ -179,5 +180,103 @@ public class GuardrailsValidatorTests
     {
         var result = _validator.ValidateReadQuery("   \n\t  ");
         Assert.False(result.IsSafe);
+    }
+
+    [Theory]
+    [InlineData("Conexion", true)]
+    [InlineData("CadenaConexion", true)]
+    [InlineData("ConnectionString", true)]
+    [InlineData("DefaultConnection", true)]
+    [InlineData("RemoteConnectionString", true)]
+    [InlineData("MiConexionSql", true)]
+    [InlineData("Customer_Connection_Str", true)]
+    [InlineData("Nombre", false)]
+    [InlineData("CodigoArticulo", false)]
+    [InlineData("SaldoTotal", false)]
+    [InlineData("EmailAddress", false)]
+    public void IsColumnDenied_ShouldMaskConnectionColumns(string columnName, bool expected)
+    {
+        bool result = _validator.IsColumnDenied(columnName);
+        Assert.Equal(expected, result);
+    }
+
+    [Theory]
+    [InlineData("SELECT * FROM RemoteServer.FinanceDb.dbo.Customers")]
+    [InlineData("SELECT * FROM [LINKED_SRV].[RemoteDb].[dbo].[RemoteInvoices]")]
+    [InlineData("SELECT * FROM RemoteServer.FinanceDb..Customers")]
+    [InlineData("SELECT * FROM [LINKED_SRV].[RemoteDb]..[RemoteInvoices]")]
+    [InlineData("SELECT * FROM RemoteServer...Customers")]
+    [InlineData("SELECT * FROM [LINKED_SRV]...[RemoteInvoices]")]
+    [InlineData("SELECT * FROM [LINKED_SRV]..[RemoteSchema].[RemoteInvoices]")]
+    [InlineData("SELECT * FROM \"RemoteServer\".\"FinanceDb\".\"dbo\".\"Customers\"")]
+    [InlineData("SELECT * FROM [LINKED_SRV]  .  [RemoteDb]  .  [dbo]  .  [RemoteInvoices]")]
+    [InlineData("SELECT * FROM (SELECT * FROM [LINKED_SRV].[RemoteDb].[dbo].[RemoteInvoices]) AS SubQuery")]
+    [InlineData("SELECT a.Id, b.Name FROM LocalTable a INNER JOIN RemoteServer.FinanceDb.dbo.Customers b ON a.Id = b.Id")]
+    [InlineData("SELECT a.Id, b.Name FROM LocalTable a LEFT JOIN [LINKED_SRV].[RemoteDb].[dbo].[RemoteInvoices] b ON a.Id = b.Id")]
+    [InlineData("WITH CTE AS (SELECT * FROM [LINKED_SRV].[RemoteDb].[dbo].[RemoteInvoices]) SELECT * FROM CTE")]
+    public void ValidateReadQuery_ShouldReject_FourPartObjectIdentifiers(string sql)
+    {
+        var result = _validator.ValidateReadQuery(sql);
+        Assert.False(result.IsSafe, $"Query '{sql}' should have been rejected for four-part identifiers.");
+        Assert.Contains("strictly prohibited by security guardrails", result.ErrorMessage, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("Four-part object identifiers", result.ErrorMessage, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData("SELECT * FROM Audit WHERE endpoint = 'https://api.example.internal/v1/data'")]
+    [InlineData("SELECT * FROM Audit WHERE client_ip = '127.0.0.1'")]
+    [InlineData("SELECT * FROM Audit WHERE note = 'Referenced [LINKED_SRV].[RemoteDb].[dbo].[RemoteInvoices]'")]
+    [InlineData("SELECT * FROM Clientes")]
+    [InlineData("SELECT * FROM dbo.Clientes")]
+    [InlineData("SELECT * FROM [dbo].[Clientes]")]
+    [InlineData("SELECT * FROM LocalDatabase.dbo.Clientes")]
+    [InlineData("SELECT * FROM [LocalDatabase].[dbo].[Clientes]")]
+    [InlineData("SELECT * FROM LocalDatabase..Clientes")]
+    [InlineData("SELECT c.Id, c.Nombre, o.Total FROM dbo.Clientes c INNER JOIN dbo.Pedidos o ON c.Id = o.ClienteId")]
+    [InlineData("SELECT * FROM Products WHERE Price > 12.34 AND Discount <= 0.5")]
+    [InlineData("SELECT t.a, t.b FROM dbo.MyTable t WHERE t.a = 1.0001")]
+    public void ValidateReadQuery_ShouldNotHaveFalsePositives_ForUrlsIpsAndLocalIdentifiers(string sql)
+    {
+        var result = _validator.ValidateReadQuery(sql);
+        Assert.True(result.IsSafe, $"Query '{sql}' was unexpectedly rejected: {result.ErrorMessage}");
+    }
+
+    [Theory]
+    [InlineData("RemoteServer.FinanceDb.dbo.Customers")]
+    [InlineData("[LINKED_SRV].[RemoteDb].[dbo].[RemoteInvoices]")]
+    [InlineData("RemoteServer.FinanceDb..Customers")]
+    [InlineData("[LINKED_SRV].[RemoteDb]..[RemoteInvoices]")]
+    [InlineData("RemoteServer...Customers")]
+    [InlineData("[LINKED_SRV]...[RemoteInvoices]")]
+    [InlineData("[LINKED_SRV]..[RemoteSchema].[RemoteInvoices]")]
+    [InlineData("\"RemoteServer\".\"FinanceDb\".\"dbo\".\"Customers\"")]
+    public void ValidateNoFourPartIdentifier_ShouldThrow_ForFourPartIdentifiers(string identifier)
+    {
+        var ex = Assert.Throws<SecurityException>(() => _validator.ValidateNoFourPartIdentifier(identifier, "Object"));
+        Assert.Contains("strictly prohibited by security guardrails", ex.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("Four-part object identifiers", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData("Clientes")]
+    [InlineData("dbo.Clientes")]
+    [InlineData("[dbo].[Clientes]")]
+    [InlineData("LocalDb.dbo.Clientes")]
+    [InlineData("[LocalDb].[dbo].[Clientes]")]
+    [InlineData("LocalDb..Clientes")]
+    public void ValidateNoFourPartIdentifier_ShouldAllow_OneTwoThreePartIdentifiers(string identifier)
+    {
+        // Should not throw
+        _validator.ValidateNoFourPartIdentifier(identifier, "Object");
+    }
+
+    [Theory]
+    [InlineData("RemoteServer.FinanceDb.dbo.Customers")]
+    [InlineData("[LINKED_SRV].[RemoteDb].[dbo].[RemoteInvoices]")]
+    [InlineData("[LINKED_SRV]...[RemoteInvoices]")]
+    public void ValidateTable_ShouldThrow_ForFourPartTableNames(string tableName)
+    {
+        var ex = Assert.Throws<SecurityException>(() => _validator.ValidateTable(tableName));
+        Assert.Contains("Four-part object identifiers", ex.Message, StringComparison.OrdinalIgnoreCase);
     }
 }

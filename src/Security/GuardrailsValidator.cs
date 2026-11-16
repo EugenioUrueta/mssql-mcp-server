@@ -35,6 +35,15 @@ public class GuardrailsValidator
         }) + @")\b",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
+    private static readonly Regex FourPartNameRegex = new(
+        @"(?:\b|(?=[\[""]))" +
+        @"(?:\[[^\]\r\n]+\]|""[^""\r\n]+""|[a-zA-Z_#@$][a-zA-Z0-9_#@$]*)" +
+        @"(?:\s*\.\s*(?:\[[^\]\r\n]+\]|""[^""\r\n]+""|[a-zA-Z_#@$][a-zA-Z0-9_#@$]*)?){2,}" +
+        @"\s*\.\s*" +
+        @"(?:\[[^\]\r\n]+\]|""[^""\r\n]+""|[a-zA-Z_#@$][a-zA-Z0-9_#@$]*)" +
+        @"(?:\b|(?<=[\]""]))",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
     public GuardrailsValidator(GlobalSecurity security)
     {
         _security = security ?? new GlobalSecurity();
@@ -68,12 +77,46 @@ public class GuardrailsValidator
     }
 
     /// <summary>
+    /// Validates that an identifier (table, stored procedure, etc.) does not contain 4 parts or references to linked servers.
+    /// </summary>
+    public void ValidateNoFourPartIdentifier(string rawIdentifier, string objectType = "Object")
+    {
+        if (!_security.ProhibitFourPartNames || string.IsNullOrWhiteSpace(rawIdentifier))
+            return;
+
+        string trimmed = rawIdentifier.Trim();
+
+        if (FourPartNameRegex.IsMatch(trimmed) || CountIdentifierDots(trimmed) >= 3)
+        {
+            throw new SecurityException($"Four-part object identifiers (linked server references) like '{trimmed}' are strictly prohibited by security guardrails.");
+        }
+    }
+
+    private static int CountIdentifierDots(string identifier)
+    {
+        int count = 0;
+        bool inBracket = false;
+        bool inQuote = false;
+        for (int i = 0; i < identifier.Length; i++)
+        {
+            char c = identifier[i];
+            if (c == '[' && !inQuote) inBracket = true;
+            else if (c == ']' && inBracket) inBracket = false;
+            else if (c == '"' && !inBracket) inQuote = !inQuote;
+            else if (c == '.' && !inBracket && !inQuote) count++;
+        }
+        return count;
+    }
+
+    /// <summary>
     /// Validates whether access to the target table is allowed.
     /// </summary>
     public void ValidateTable(string tableName)
     {
         if (string.IsNullOrWhiteSpace(tableName))
             throw new ArgumentException("Table name cannot be empty.", nameof(tableName));
+
+        ValidateNoFourPartIdentifier(tableName, "Table");
 
         // Normalize table name: remove brackets and isolate schema / object name
         string cleanTable = tableName.Trim();
@@ -157,7 +200,17 @@ public class GuardrailsValidator
             return QuerySafetyResult.Unsafe($"Only 'SELECT' or 'WITH' (CTE) queries are permitted in read_query. Detected root command: '{rootCommand}'.");
         }
 
-        // 3. Scan for hazardous keywords outside strings and comments
+        // 3. Check for four-part object identifiers (linked server references)
+        if (_security.ProhibitFourPartNames)
+        {
+            var fourPartMatch = FourPartNameRegex.Match(strippedSql);
+            if (fourPartMatch.Success)
+            {
+                return QuerySafetyResult.Unsafe($"Four-part object identifiers (linked server references) like '{fourPartMatch.Value.Trim()}' are strictly prohibited by security guardrails.");
+            }
+        }
+
+        // 4. Scan for hazardous keywords outside strings and comments
         var hazardousMatch = HazardousRegex.Match(strippedSql);
         if (hazardousMatch.Success)
         {

@@ -120,7 +120,24 @@ public class ExecuteSpTool : IMcpToolHandler
         // Parse profile config and check permissions
         try
         {
-            var (_, profileConfig) = _connectionManager.GetProfile(profile);
+            _validator.ValidateNoFourPartIdentifier(rawSp, "Stored procedure");
+            var (profileName, profileConfig) = _connectionManager.GetProfile(profile);
+
+            if (profileConfig.IsReadOnly && !simulate)
+            {
+                throw new System.Security.SecurityException("Current profile is read-only. Live execution of stored procedures is prohibited.");
+            }
+
+            if (!simulate && !profileConfig.AllowExecuteSp)
+            {
+                return McpToolCallResult.Error($"Execution rejected by security guardrails: Stored procedure execution is disabled by default on profile '{profileName}'. To allow execution, configure 'allowExecuteSp: true'.");
+            }
+
+            if (simulate && !profileConfig.AllowSimulation)
+            {
+                return McpToolCallResult.Error($"Execution rejected by security guardrails: Stored procedure simulation is disabled by default on profile '{profileName}'. To allow simulation, configure 'allowSimulation: true'.");
+            }
+
             _validator.ValidateExecutionPermissions(profileConfig, simulate);
         }
         catch (Exception ex)

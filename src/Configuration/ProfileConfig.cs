@@ -30,12 +30,12 @@ public class ProfileConfig
     /// <summary>
     /// Whether stored procedure execution is permitted.
     /// </summary>
-    public bool AllowExecuteSp { get; set; } = true;
+    public bool AllowExecuteSp { get; set; } = false;
 
     /// <summary>
     /// Whether simulated execution (transaction rollback) is allowed.
     /// </summary>
-    public bool AllowSimulation { get; set; } = true;
+    public bool AllowSimulation { get; set; } = false;
 
     /// <summary>
     /// Human-readable description of this profile.

@@ -7,6 +7,7 @@ using System.Threading.Tasks;
 using Microsoft.Data.SqlClient;
 using MssqlMcpServer.Context;
 using MssqlMcpServer.Protocol;
+using MssqlMcpServer.Security;
 
 namespace MssqlMcpServer.Tools;
 
@@ -26,10 +27,17 @@ public class StoredProcedureInfo
 public class GetSpDefinitionTool : IMcpToolHandler
 {
     private readonly InstanceConnectionManager _connectionManager;
+    private readonly GuardrailsValidator? _validator;
 
     public GetSpDefinitionTool(InstanceConnectionManager connectionManager)
+        : this(connectionManager, null)
+    {
+    }
+
+    public GetSpDefinitionTool(InstanceConnectionManager connectionManager, GuardrailsValidator? validator)
     {
         _connectionManager = connectionManager;
+        _validator = validator;
     }
 
     public McpToolDefinition Definition => new()
@@ -187,6 +195,19 @@ public class GetSpDefinitionTool : IMcpToolHandler
         if (spList.Count == 0)
         {
             return McpToolCallResult.Error("The 'sp_name' or 'sp_names' parameter is required.");
+        }
+
+        // Validate all stored procedures against security guardrails
+        foreach (var sp in spList)
+        {
+            try
+            {
+                _validator?.ValidateNoFourPartIdentifier(sp, "Stored procedure");
+            }
+            catch (Exception ex)
+            {
+                return McpToolCallResult.Error($"Security guardrail blocked: {ex.Message}");
+            }
         }
 
         bool summaryOnly = false;

@@ -52,8 +52,8 @@ public class Program
                         Description = "Default profile configured via environment variables",
                         AllowedDatabases = new() { "*" },
                         IsReadOnly = false,
-                        AllowExecuteSp = true,
-                        AllowSimulation = true
+                        AllowExecuteSp = false,
+                        AllowSimulation = false
                     };
                     settings.Profiles[targetProfile] = profileConfig;
                     settings.DefaultProfile = targetProfile;
@@ -77,7 +77,22 @@ public class Program
             }
             if (settings.Security.DeniedColumns.Count == 0)
             {
-                settings.Security.DeniedColumns = new() { "*Password*", "*Token*", "*Secret*", "*Hash*", "*Salt*", "*Clave*", "*Passw*", "*Contrasen*", "*Pin*" };
+                settings.Security.DeniedColumns = new()
+                {
+                    "*Password*",
+                    "*Token*",
+                    "*Secret*",
+                    "*Hash*",
+                    "*Salt*",
+                    "*Clave*",
+                    "*Passw*",
+                    "*Contrasen*",
+                    "*Pin*",
+                    "*Conexion*",
+                    "*Connection*",
+                    "*ConnectionString*",
+                    "*CadenaConexion*"
+                };
             }
 
             // Initialize Core Services
@@ -94,7 +109,7 @@ public class Program
                 new SearchObjectsTool(connectionManager, validator),
                 new GetTableSchemaTool(connectionManager, validator),
                 new GetDatabaseSummaryTool(connectionManager, validator),
-                new GetSpDefinitionTool(connectionManager),
+                new GetSpDefinitionTool(connectionManager, validator),
                 new GetProcedureSignaturesTool(connectionManager, validator),
                 new ExecuteSpTool(connectionManager, validator),
                 new ReadQueryTool(connectionManager, validator, settings.Security)
