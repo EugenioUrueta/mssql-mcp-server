@@ -610,4 +610,229 @@ public class ToolExecutionTests
         Assert.DoesNotContain("parameter is required", result.Content[0].Text, StringComparison.OrdinalIgnoreCase);
         Assert.Contains("Error retrieving table schema", result.Content[0].Text, StringComparison.OrdinalIgnoreCase);
     }
+
+    [Fact]
+    public async Task InstanceConnectionManager_GetCompatibilityLevelAsync_StoresAndReturnsLevel()
+    {
+        // 1. Initial call without prior cache: connects or falls back to 130 and caches it
+        int level1 = await _connectionManager.GetCompatibilityLevelAsync("dev", "DB_Test_Dev");
+        Assert.Equal(130, level1);
+        Assert.True(_connectionManager.CompatibilityLevels.ContainsKey("dev:DB_Test_Dev"));
+        Assert.Equal(130, _connectionManager.CompatibilityLevels["dev:DB_Test_Dev"]);
+
+        // 2. Pre-set cache value: must return cached value without connecting
+        _connectionManager.CompatibilityLevels["dev:DB_Cached"] = 150;
+        int cachedLevel = await _connectionManager.GetCompatibilityLevelAsync("dev", "DB_Cached");
+        Assert.Equal(150, cachedLevel);
+    }
+
+    [Fact]
+    public async Task SwitchContextTool_ReturnsCompatibilityLevelInJsonResponse()
+    {
+        var tool = new SwitchContextTool(_sessionContext, _connectionManager);
+
+        string argsJson = """
+        {
+            "profile": "dev",
+            "database": "DB_Test_Dev"
+        }
+        """;
+
+        using var doc = JsonDocument.Parse(argsJson);
+        var result = await tool.ExecuteAsync(doc.RootElement);
+
+        Assert.False(result.IsError);
+        using var resDoc = JsonDocument.Parse(result.Content[0].Text);
+        var root = resDoc.RootElement;
+
+        Assert.Equal("dev", root.GetProperty("activeProfile").GetString());
+        Assert.Equal("DB_Test_Dev", root.GetProperty("activeDatabase").GetString());
+        Assert.True(root.TryGetProperty("compatibilityLevel", out var compProp));
+        Assert.Equal(130, compProp.GetInt32());
+    }
+
+    [Theory]
+    [InlineData("{}")]
+    [InlineData("""{"indent": true}""")]
+    [InlineData("""{"format": "compact"}""")]
+    public async Task GetProcedureSignaturesTool_RejectsWhenMissingRequiredParameters(string argsJson)
+    {
+        var tool = new GetProcedureSignaturesTool(_connectionManager, _validator);
+
+        using var doc = JsonDocument.Parse(argsJson);
+        var result = await tool.ExecuteAsync(doc.RootElement);
+
+        Assert.True(result.IsError);
+        Assert.Contains("parameter", result.Content[0].Text, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task GetProcedureSignaturesTool_RejectsWhenArgumentsNull()
+    {
+        var tool = new GetProcedureSignaturesTool(_connectionManager, _validator);
+
+        var result = await tool.ExecuteAsync(null);
+
+        Assert.True(result.IsError);
+        Assert.Contains("Arguments object is required", result.Content[0].Text, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData("""{"pattern": "gen_%"}""")]
+    [InlineData("""{"patterns": ["gen_%", "car_%"]}""")]
+    [InlineData("""{"search": "inv_*"}""")]
+    [InlineData("""{"query": "dbo.gen_articulos"}""")]
+    [InlineData("""{"pattern": "gen_%, car_%"}""")]
+    public async Task GetProcedureSignaturesTool_AcceptsPatternAliases_ProceedsPastValidation(string argsJson)
+    {
+        var tool = new GetProcedureSignaturesTool(_connectionManager, _validator);
+
+        using var doc = JsonDocument.Parse(argsJson);
+        var result = await tool.ExecuteAsync(doc.RootElement);
+
+        Assert.True(result.IsError);
+        Assert.DoesNotContain("is required", result.Content[0].Text, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("Error retrieving procedure signatures", result.Content[0].Text, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData("""{"sp_name": "dbo.gen_articulos_get"}""")]
+    [InlineData("""{"sp_names": ["gen_articulos_get", "car_recibos_get"]}""")]
+    [InlineData("""{"procedure_name": "dbo.gen_articulos_get"}""")]
+    [InlineData("""{"procedure_names": ["gen_articulos_get"]}""")]
+    [InlineData("""{"procedures": ["gen_articulos_get"]}""")]
+    [InlineData("""{"procedure": "dbo.gen_articulos_get"}""")]
+    [InlineData("""{"names": ["dbo.gen_articulos_get"]}""")]
+    [InlineData("""{"name": "gen_articulos_get"}""")]
+    [InlineData("""{"sp_name": "gen_articulos_get, car_recibos_get"}""")]
+    public async Task GetProcedureSignaturesTool_AcceptsProcedureNameAliases_ProceedsPastValidation(string argsJson)
+    {
+        var tool = new GetProcedureSignaturesTool(_connectionManager, _validator);
+
+        using var doc = JsonDocument.Parse(argsJson);
+        var result = await tool.ExecuteAsync(doc.RootElement);
+
+        Assert.True(result.IsError);
+        Assert.DoesNotContain("is required", result.Content[0].Text, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("Error retrieving procedure signatures", result.Content[0].Text, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void GetProcedureSignaturesTool_FormatResult_FormatsSignaturesCorrectly()
+    {
+        var sampleProcs = new List<ProcedureSignatureInfo>
+        {
+            new()
+            {
+                Schema = "dbo",
+                Name = "usp_calculate_tax",
+                ParameterCount = 3,
+                Signature = "@amount decimal(18,2), @rate decimal(5,2), @tax decimal(18,2) OUTPUT"
+            },
+            new()
+            {
+                Schema = "dbo",
+                Name = "usp_get_all_active",
+                ParameterCount = 0,
+                Signature = ""
+            }
+        };
+
+        object resultObj = GetProcedureSignaturesTool.FormatResult("TestDatabase", 130, sampleProcs, "objects", false);
+        string json = JsonSerializer.Serialize(resultObj);
+
+        using var doc = JsonDocument.Parse(json);
+        var root = doc.RootElement;
+
+        Assert.Equal("TestDatabase", root.GetProperty("database").GetString());
+        Assert.Equal(130, root.GetProperty("compatibilityLevel").GetInt32());
+        Assert.Equal(2, root.GetProperty("count").GetInt32());
+
+        var procsArray = root.GetProperty("procedures");
+        Assert.Equal(2, procsArray.GetArrayLength());
+
+        var p1 = procsArray[0];
+        Assert.Equal("dbo", p1.GetProperty("schema").GetString());
+        Assert.Equal("usp_calculate_tax", p1.GetProperty("name").GetString());
+        Assert.Equal("dbo.usp_calculate_tax", p1.GetProperty("fullName").GetString());
+        Assert.Equal(3, p1.GetProperty("parameterCount").GetInt32());
+        Assert.Equal("@amount decimal(18,2), @rate decimal(5,2), @tax decimal(18,2) OUTPUT", p1.GetProperty("signature").GetString());
+        Assert.False(p1.TryGetProperty("details", out _));
+
+        var p2 = procsArray[1];
+        Assert.Equal(0, p2.GetProperty("parameterCount").GetInt32());
+        Assert.Equal("", p2.GetProperty("signature").GetString());
+    }
+
+    [Fact]
+    public void GetProcedureSignaturesTool_FormatResult_RespectsCompactFormatAndIncludeDetails()
+    {
+        var sampleProcs = new List<ProcedureSignatureInfo>
+        {
+            new()
+            {
+                Schema = "dbo",
+                Name = "usp_calculate_tax",
+                ParameterCount = 2,
+                Signature = "@amount decimal(18,2), @tax decimal(18,2) OUTPUT",
+                Details = new List<ProcedureParameterDetail>
+                {
+                    new() { Name = "@amount", DataType = "decimal", MaxLength = 9, Precision = 18, Scale = 2, IsOutput = false },
+                    new() { Name = "@tax", DataType = "decimal", MaxLength = 9, Precision = 18, Scale = 2, IsOutput = true }
+                }
+            }
+        };
+
+        // 1. Compact format with details
+        object compactObj = GetProcedureSignaturesTool.FormatResult("TestDatabase", 150, sampleProcs, "compact", true);
+        string compactJson = JsonSerializer.Serialize(compactObj);
+
+        using (var doc = JsonDocument.Parse(compactJson))
+        {
+            var root = doc.RootElement;
+            Assert.Equal("TestDatabase", root.GetProperty("database").GetString());
+            Assert.Equal(150, root.GetProperty("compatibilityLevel").GetInt32());
+            Assert.Equal(1, root.GetProperty("count").GetInt32());
+
+            var columns = root.GetProperty("columns");
+            Assert.Equal(5, columns.GetArrayLength());
+            Assert.Equal("schema", columns[0].GetString());
+            Assert.Equal("name", columns[1].GetString());
+            Assert.Equal("parameterCount", columns[2].GetString());
+            Assert.Equal("signature", columns[3].GetString());
+            Assert.Equal("details", columns[4].GetString());
+
+            var rows = root.GetProperty("procedures");
+            Assert.Equal(1, rows.GetArrayLength());
+            var row0 = rows[0];
+            Assert.Equal("dbo", row0[0].GetString());
+            Assert.Equal("usp_calculate_tax", row0[1].GetString());
+            Assert.Equal(2, row0[2].GetInt32());
+            Assert.Equal("@amount decimal(18,2), @tax decimal(18,2) OUTPUT", row0[3].GetString());
+
+            var detailsArray = row0[4];
+            Assert.Equal(2, detailsArray.GetArrayLength());
+            Assert.Equal("@amount", detailsArray[0].GetProperty("name").GetString());
+            Assert.Equal("decimal", detailsArray[0].GetProperty("dataType").GetString());
+            Assert.Equal(9, detailsArray[0].GetProperty("maxLength").GetInt32());
+            Assert.Equal(18, detailsArray[0].GetProperty("precision").GetInt32());
+            Assert.Equal(2, detailsArray[0].GetProperty("scale").GetInt32());
+            Assert.False(detailsArray[0].GetProperty("isOutput").GetBoolean());
+            Assert.True(detailsArray[1].GetProperty("isOutput").GetBoolean());
+        }
+
+        // 2. Objects format with details
+        object objectsObj = GetProcedureSignaturesTool.FormatResult("TestDatabase", 150, sampleProcs, "objects", true);
+        string objectsJson = JsonSerializer.Serialize(objectsObj);
+
+        using (var doc = JsonDocument.Parse(objectsJson))
+        {
+            var root = doc.RootElement;
+            var proc0 = root.GetProperty("procedures")[0];
+            Assert.True(proc0.TryGetProperty("details", out var detProp));
+            Assert.Equal(2, detProp.GetArrayLength());
+            Assert.Equal("@amount", detProp[0].GetProperty("name").GetString());
+            Assert.Equal("@tax", detProp[1].GetProperty("name").GetString());
+        }
+    }
 }

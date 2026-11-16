@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Data;
 using System.Threading;
 using System.Threading.Tasks;
@@ -16,6 +17,9 @@ public class InstanceConnectionManager
     private readonly InstanceSettings _settings;
     private readonly SessionContext _sessionContext;
     private readonly GuardrailsValidator _validator;
+    private readonly ConcurrentDictionary<string, int> _compatibilityLevels = new(StringComparer.OrdinalIgnoreCase);
+
+    public ConcurrentDictionary<string, int> CompatibilityLevels => _compatibilityLevels;
 
     public InstanceConnectionManager(
         InstanceSettings settings,
@@ -140,6 +144,44 @@ public class InstanceConnectionManager
         var fallbackConnection = new SqlConnection(connectionString);
         await fallbackConnection.OpenAsync(cancellationToken);
         return fallbackConnection;
+    }
+
+    /// <summary>
+    /// Gets the SQL Server compatibility level for the effective database, leveraging caching.
+    /// Falls back to 130 if querying sys.databases fails or is restricted.
+    /// </summary>
+    public async Task<int> GetCompatibilityLevelAsync(
+        string? profileName,
+        string? requestedDatabase,
+        CancellationToken cancellationToken = default)
+    {
+        BuildConnectionString(profileName, requestedDatabase, out string effectiveProfile, out string effectiveDatabase, out _);
+        string cacheKey = $"{effectiveProfile}:{effectiveDatabase}";
+
+        if (_compatibilityLevels.TryGetValue(cacheKey, out int cachedLevel))
+        {
+            return cachedLevel;
+        }
+
+        try
+        {
+            await using var connection = await OpenConnectionAsync(effectiveProfile, effectiveDatabase, cancellationToken);
+            await using var cmd = new SqlCommand("SELECT compatibility_level FROM sys.databases WHERE name = DB_NAME();", connection);
+            object? result = await cmd.ExecuteScalarAsync(cancellationToken);
+            if (result != null && result != DBNull.Value && int.TryParse(result.ToString(), out int level) && level > 0)
+            {
+                _compatibilityLevels[cacheKey] = level;
+                return level;
+            }
+        }
+        catch
+        {
+            // Fallback to standard compatibility level if unable to query sys.databases (e.g. lack of permissions or test mock)
+        }
+
+        const int fallbackLevel = 130;
+        _compatibilityLevels[cacheKey] = fallbackLevel;
+        return fallbackLevel;
     }
 
     private static bool IsTransient(SqlException ex)

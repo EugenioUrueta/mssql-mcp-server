@@ -95,6 +95,7 @@ public class Program
                 new GetTableSchemaTool(connectionManager, validator),
                 new GetDatabaseSummaryTool(connectionManager, validator),
                 new GetSpDefinitionTool(connectionManager),
+                new GetProcedureSignaturesTool(connectionManager, validator),
                 new ExecuteSpTool(connectionManager, validator),
                 new ReadQueryTool(connectionManager, validator, settings.Security)
             };

@@ -41,7 +41,7 @@ public class SwitchContextTool : IMcpToolHandler
         }
     };
 
-    public Task<McpToolCallResult> ExecuteAsync(JsonElement? arguments, CancellationToken cancellationToken = default)
+    public async Task<McpToolCallResult> ExecuteAsync(JsonElement? arguments, CancellationToken cancellationToken = default)
     {
         string? newProfile = null;
         string? newDatabase = null;
@@ -60,7 +60,7 @@ public class SwitchContextTool : IMcpToolHandler
 
         if (string.IsNullOrWhiteSpace(newProfile) && string.IsNullOrWhiteSpace(newDatabase))
         {
-            return Task.FromResult(McpToolCallResult.Error("At least one parameter ('profile' or 'database') must be provided to switch context."));
+            return McpToolCallResult.Error("At least one parameter ('profile' or 'database') must be provided to switch context.");
         }
 
         try
@@ -75,21 +75,24 @@ public class SwitchContextTool : IMcpToolHandler
 
             _sessionContext.SetContext(profileName, targetDb);
 
+            int compLevel = await _connectionManager.GetCompatibilityLevelAsync(profileName, targetDb, cancellationToken);
+
             var responseObj = new
             {
                 message = "Session context updated successfully.",
                 activeProfile = _sessionContext.ActiveProfileName,
                 activeDatabase = _sessionContext.ActiveDatabaseName,
+                compatibilityLevel = compLevel,
                 isReadOnly = profileConfig.IsReadOnly,
                 allowExecuteSp = profileConfig.AllowExecuteSp
             };
 
             string json = JsonSerializer.Serialize(responseObj, new JsonSerializerOptions { WriteIndented = true });
-            return Task.FromResult(McpToolCallResult.Success(json));
+            return McpToolCallResult.Success(json);
         }
         catch (Exception ex)
         {
-            return Task.FromResult(McpToolCallResult.Error($"Failed to switch context: {ex.Message}"));
+            return McpToolCallResult.Error($"Failed to switch context: {ex.Message}");
         }
     }
 }
