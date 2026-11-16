@@ -34,12 +34,42 @@ public class ExecuteSpTool : IMcpToolHandler
                 sp_name = new
                 {
                     type = "string",
-                    description = "Name of the stored procedure to execute (e.g. 'usp_get_customer_orders' or 'dbo.usp_process_invoice')."
+                    description = "Name of the stored procedure to execute (e.g. 'usp_get_customer_orders' or 'dbo.usp_process_invoice'). Aliases: 'procedure_name', 'procedure', 'name', 'sp'."
+                },
+                procedure_name = new
+                {
+                    type = "string",
+                    description = "Alias for sp_name."
+                },
+                procedure = new
+                {
+                    type = "string",
+                    description = "Alias for sp_name."
+                },
+                name = new
+                {
+                    type = "string",
+                    description = "Alias for sp_name."
+                },
+                sp = new
+                {
+                    type = "string",
+                    description = "Alias for sp_name."
                 },
                 parameters = new
                 {
                     type = "object",
-                    description = "Key-value dictionary of parameter names and their values (e.g. { '@TenantId': 1, '@OrderId': 42 })."
+                    description = "Key-value dictionary of parameter names and their values (e.g. { '@TenantId': 1, '@OrderId': 42 }). Aliases: 'params', 'args'."
+                },
+                @params = new
+                {
+                    type = "object",
+                    description = "Alias for parameters."
+                },
+                args = new
+                {
+                    type = "object",
+                    description = "Alias for parameters."
                 },
                 simulate = new
                 {
@@ -68,12 +98,21 @@ public class ExecuteSpTool : IMcpToolHandler
             return McpToolCallResult.Error("Arguments object is required with a 'sp_name' property.");
         }
 
-        if (!arguments.Value.TryGetProperty("sp_name", out var spProp) || string.IsNullOrWhiteSpace(spProp.GetString()))
+        string[] spAliases = { "sp_name", "procedure_name", "procedure", "name", "sp" };
+        string? rawSp = null;
+        foreach (var alias in spAliases)
+        {
+            if (arguments.Value.TryGetProperty(alias, out var spProp) && !string.IsNullOrWhiteSpace(spProp.GetString()))
+            {
+                rawSp = spProp.GetString()!.Trim();
+                break;
+            }
+        }
+
+        if (string.IsNullOrWhiteSpace(rawSp))
         {
             return McpToolCallResult.Error("The 'sp_name' parameter is required.");
         }
-
-        string rawSp = spProp.GetString()!.Trim();
         bool simulate = arguments.Value.TryGetProperty("simulate", out var simProp) && simProp.GetBoolean();
         string? profile = arguments.Value.TryGetProperty("profile", out var prProp) ? prProp.GetString() : null;
         string? database = arguments.Value.TryGetProperty("database", out var dbProp) ? dbProp.GetString() : null;
@@ -160,12 +199,17 @@ WHERE s.name = @SchemaName AND o.name = @SpName;";
 
                 // Add configured parameters
                 var userParams = new Dictionary<string, JsonElement>(StringComparer.OrdinalIgnoreCase);
-                if (arguments.Value.TryGetProperty("parameters", out var pElem) && pElem.ValueKind == JsonValueKind.Object)
+                string[] paramAliases = { "parameters", "params", "args" };
+                foreach (var alias in paramAliases)
                 {
-                    foreach (var prop in pElem.EnumerateObject())
+                    if (arguments.Value.TryGetProperty(alias, out var pElem) && pElem.ValueKind == JsonValueKind.Object)
                     {
-                        string key = prop.Name.StartsWith('@') ? prop.Name : "@" + prop.Name;
-                        userParams[key] = prop.Value;
+                        foreach (var prop in pElem.EnumerateObject())
+                        {
+                            string key = prop.Name.StartsWith('@') ? prop.Name : "@" + prop.Name;
+                            userParams[key] = prop.Value;
+                        }
+                        break;
                     }
                 }
 

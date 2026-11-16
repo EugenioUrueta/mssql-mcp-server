@@ -835,4 +835,260 @@ public class ToolExecutionTests
             Assert.Equal("@tax", detProp[1].GetProperty("name").GetString());
         }
     }
+
+    [Theory]
+    [InlineData("DROP TABLE dbo.Invoices")]
+    [InlineData("DELETE FROM dbo.Orders WHERE 1=1")]
+    [InlineData("TRUNCATE TABLE dbo.AuditLog")]
+    [InlineData("ALTER TABLE dbo.Products ADD MaliciousCol INT")]
+    [InlineData("UPDATE dbo.Customers SET Name = 'Attacker'")]
+    [InlineData("INSERT INTO dbo.Orders (Id) VALUES (1)")]
+    public async Task ReadQueryTool_AcceptsSqlAlias_RejectsModifyingQueries(string sql)
+    {
+        var tool = new ReadQueryTool(_connectionManager, _validator, _settings.Security);
+
+        var argsObj = new { sql };
+        using var doc = JsonDocument.Parse(JsonSerializer.Serialize(argsObj));
+        var result = await tool.ExecuteAsync(doc.RootElement);
+
+        Assert.True(result.IsError);
+        Assert.Contains("rejected by guardrails", result.Content[0].Text, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData("SELECT id, name FROM dbo.Customers")]
+    [InlineData("WITH cte AS (SELECT 1 AS n) SELECT * FROM cte")]
+    [InlineData("SELECT COUNT(*) AS total FROM dbo.Invoices")]
+    public async Task ReadQueryTool_AcceptsSqlAlias_ValidReadQuery_ProceedsPastValidation(string sql)
+    {
+        var tool = new ReadQueryTool(_connectionManager, _validator, _settings.Security);
+
+        var argsObj = new { sql };
+        using var doc = JsonDocument.Parse(JsonSerializer.Serialize(argsObj));
+        var result = await tool.ExecuteAsync(doc.RootElement);
+
+        // Validation succeeded: it did NOT fail with "The 'query' (or 'sql') parameter is required."
+        // It failed at connection level, proving 'sql' alias was accepted and validated as safe.
+        Assert.True(result.IsError);
+        Assert.DoesNotContain("parameter is required", result.Content[0].Text, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("Error executing read query", result.Content[0].Text, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void ReadQueryTool_Definition_HasSqlAlias()
+    {
+        var tool = new ReadQueryTool(_connectionManager, _validator, _settings.Security);
+        var def = tool.Definition;
+
+        Assert.Equal("read_query", def.Name);
+        var schemaJson = JsonSerializer.Serialize(def.InputSchema);
+        using var doc = JsonDocument.Parse(schemaJson);
+        var props = doc.RootElement.GetProperty("properties");
+
+        Assert.True(props.TryGetProperty("query", out _));
+        Assert.True(props.TryGetProperty("sql", out _));
+    }
+
+    [Theory]
+    [InlineData("""{"procedure_name": "dbo.usp_get_customer_orders"}""")]
+    [InlineData("""{"procedure": "dbo.usp_get_customer_orders"}""")]
+    [InlineData("""{"name": "dbo.usp_get_customer_orders"}""")]
+    [InlineData("""{"sp": "dbo.usp_get_customer_orders"}""")]
+    public async Task ExecuteSpTool_AcceptsSpNameAliases_ProceedsPastValidation(string argsJson)
+    {
+        var tool = new ExecuteSpTool(_connectionManager, _validator);
+
+        using var doc = JsonDocument.Parse(argsJson);
+        var result = await tool.ExecuteAsync(doc.RootElement);
+
+        // Alias was accepted: it did NOT fail with "The 'sp_name' parameter is required."
+        // Fails at connection step
+        Assert.True(result.IsError);
+        Assert.DoesNotContain("parameter is required", result.Content[0].Text, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData("""{"sp_name": "usp_get_customer_orders", "params": {"@CustomerId": 101}}""")]
+    [InlineData("""{"procedure_name": "usp_get_customer_orders", "args": {"@CustomerId": 102, "@Status": "ACTIVE"}}""")]
+    [InlineData("""{"procedure": "usp_get_customer_orders", "params": {"@OrderId": 42}}""")]
+    [InlineData("""{"sp": "usp_get_customer_orders", "args": {"@Limit": 10}}""")]
+    public async Task ExecuteSpTool_AcceptsParamAliases_ParamsAndArgs_ProceedsPastValidation(string argsJson)
+    {
+        var tool = new ExecuteSpTool(_connectionManager, _validator);
+
+        using var doc = JsonDocument.Parse(argsJson);
+        var result = await tool.ExecuteAsync(doc.RootElement);
+
+        Assert.True(result.IsError);
+        Assert.DoesNotContain("parameter is required", result.Content[0].Text, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData("{}")]
+    [InlineData("""{"params": {"@Id": 1}}""")]
+    [InlineData("""{"args": {"@Id": 1}}""")]
+    [InlineData("""{"sp_name": "   "}""")]
+    [InlineData("""{"procedure_name": ""}""")]
+    [InlineData("""{"procedure": " "}""")]
+    [InlineData("""{"name": ""}""")]
+    [InlineData("""{"sp": " "}""")]
+    public async Task ExecuteSpTool_RejectsWhenAllSpNameAliasesMissingOrEmpty(string argsJson)
+    {
+        var tool = new ExecuteSpTool(_connectionManager, _validator);
+
+        using var doc = JsonDocument.Parse(argsJson);
+        var result = await tool.ExecuteAsync(doc.RootElement);
+
+        Assert.True(result.IsError);
+        Assert.Contains("The 'sp_name' parameter is required", result.Content[0].Text, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void ExecuteSpTool_Definition_HasAliases()
+    {
+        var tool = new ExecuteSpTool(_connectionManager, _validator);
+        var schemaJson = JsonSerializer.Serialize(tool.Definition.InputSchema);
+
+        using var doc = JsonDocument.Parse(schemaJson);
+        var props = doc.RootElement.GetProperty("properties");
+
+        Assert.True(props.TryGetProperty("sp_name", out _));
+        Assert.True(props.TryGetProperty("procedure_name", out _));
+        Assert.True(props.TryGetProperty("procedure", out _));
+        Assert.True(props.TryGetProperty("name", out _));
+        Assert.True(props.TryGetProperty("sp", out _));
+        Assert.True(props.TryGetProperty("parameters", out _));
+        Assert.True(props.TryGetProperty("params", out _));
+        Assert.True(props.TryGetProperty("args", out _));
+    }
+
+    [Fact]
+    public void GetTableSchemaTool_IndexesQuery_IsBackwardCompatible_NoStringAgg()
+    {
+        // Must NOT use STRING_AGG which is only supported on SQL Server 2017+ (compatibility_level >= 140)
+        Assert.DoesNotContain("STRING_AGG", GetTableSchemaTool.IndexesSql, StringComparison.OrdinalIgnoreCase);
+
+        // Must use STUFF with FOR XML PATH and .value('.', 'NVARCHAR(MAX)') for SQL Server 2008+ compatibility
+        Assert.Contains("STUFF", GetTableSchemaTool.IndexesSql, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("FOR XML PATH", GetTableSchemaTool.IndexesSql, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("TYPE", GetTableSchemaTool.IndexesSql, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains(".value('.', 'NVARCHAR(MAX)')", GetTableSchemaTool.IndexesSql, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("sys.index_columns", GetTableSchemaTool.IndexesSql, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void GetTableSchemaTool_IncomingFkQuery_CorrectlyJoinsSysForeignKeys()
+    {
+        Assert.Contains("sys.foreign_keys", GetTableSchemaTool.IncomingFkSql, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("sys.foreign_key_columns", GetTableSchemaTool.IncomingFkSql, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("fk.referenced_object_id = t.object_id", GetTableSchemaTool.IncomingFkSql, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("OBJECT_SCHEMA_NAME(fk.parent_object_id)", GetTableSchemaTool.IncomingFkSql, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("OBJECT_NAME(fk.parent_object_id)", GetTableSchemaTool.IncomingFkSql, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void GetTableSchemaTool_Definition_HasSampleRowsAndAliases()
+    {
+        var tool = new GetTableSchemaTool(_connectionManager, _validator);
+        Assert.Contains("incoming", tool.Definition.Description, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("sample rows", tool.Definition.Description, StringComparison.OrdinalIgnoreCase);
+
+        var schemaJson = JsonSerializer.Serialize(tool.Definition.InputSchema);
+        using var doc = JsonDocument.Parse(schemaJson);
+        var props = doc.RootElement.GetProperty("properties");
+
+        Assert.True(props.TryGetProperty("sample_rows", out _));
+        Assert.True(props.TryGetProperty("sample", out _));
+        Assert.True(props.TryGetProperty("samples", out _));
+    }
+
+    [Theory]
+    [InlineData("""{"table": "dbo.Customers", "sample_rows": 3}""")]
+    [InlineData("""{"table_name": "dbo.Orders", "sample": 5}""")]
+    [InlineData("""{"table": "dbo.Products", "samples": 1}""")]
+    [InlineData("""{"tables": ["dbo.Orders", "dbo.Customers"], "sample_rows": 2}""")]
+    public async Task GetTableSchemaTool_AcceptsSampleRowsAliases_ProceedsPastValidation(string argsJson)
+    {
+        var tool = new GetTableSchemaTool(_connectionManager, _validator);
+
+        using var doc = JsonDocument.Parse(argsJson);
+        var result = await tool.ExecuteAsync(doc.RootElement);
+
+        Assert.True(result.IsError);
+        Assert.DoesNotContain("parameter is required", result.Content[0].Text, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("Error retrieving table schema", result.Content[0].Text, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData("C", "COLUMN")]
+    [InlineData("c", "COLUMN")]
+    [InlineData("COL", "COLUMN")]
+    [InlineData("col", "COLUMN")]
+    [InlineData("COLUMN", "COLUMN")]
+    [InlineData("column", "COLUMN")]
+    [InlineData("COLUMNS", "COLUMN")]
+    [InlineData("columns", "COLUMN")]
+    public void SearchObjectsTool_NormalizeObjectType_MapsColumnAliases(string input, string expected)
+    {
+        string? result = SearchObjectsTool.NormalizeObjectType(input);
+        Assert.Equal(expected, result);
+    }
+
+    [Fact]
+    public void SearchObjectsTool_BuildTypeClause_HandlesColumnTypeGracefully()
+    {
+        // When only COLUMN is supplied, BuildTypeClause returns "1 = 1" without throwing
+        string clauseOnlyCol = SearchObjectsTool.BuildTypeClause(new[] { "COLUMN" });
+        Assert.Equal("1 = 1", clauseOnlyCol);
+
+        // When TABLE and COLUMN are supplied, BuildTypeClause generates filter for TABLE
+        string clauseTableAndCol = SearchObjectsTool.BuildTypeClause(new[] { "TABLE", "COLUMN" });
+        Assert.Equal("(o.type = 'U')", clauseTableAndCol);
+    }
+
+    [Fact]
+    public void SearchObjectsTool_BuildColumnSearchSql_GeneratesExpectedQuery()
+    {
+        string sql = SearchObjectsTool.BuildColumnSearchSql("c.name LIKE @ColPattern_0");
+
+        Assert.Contains("sys.columns c", sql, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("sys.objects o", sql, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("sys.schemas s", sql, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("sys.types tp", sql, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("c.name LIKE @ColPattern_0", sql, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("o.type IN ('U', 'V')", sql, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void SearchObjectsTool_Definition_HasColumnPatternAndAliases()
+    {
+        var tool = new SearchObjectsTool(_connectionManager, _validator);
+        var schemaJson = JsonSerializer.Serialize(tool.Definition.InputSchema);
+
+        using var doc = JsonDocument.Parse(schemaJson);
+        var props = doc.RootElement.GetProperty("properties");
+
+        Assert.True(props.TryGetProperty("column_pattern", out _));
+        Assert.True(props.TryGetProperty("column", out _));
+        Assert.True(props.TryGetProperty("col_pattern", out _));
+    }
+
+    [Theory]
+    [InlineData("""{"column_pattern": "email"}""")]
+    [InlineData("""{"column": "customer_id"}""")]
+    [InlineData("""{"col_pattern": "%nit%"}""")]
+    [InlineData("""{"pattern": "email", "object_type": "COLUMN"}""")]
+    [InlineData("""{"pattern": "status", "types": ["COLUMN"]}""")]
+    [InlineData("""{"pattern": "id", "types": ["TABLE", "COLUMN"]}""")]
+    public async Task SearchObjectsTool_AcceptsColumnSearchParameters_ProceedsPastValidation(string argsJson)
+    {
+        var tool = new SearchObjectsTool(_connectionManager, _validator);
+
+        using var doc = JsonDocument.Parse(argsJson);
+        var result = await tool.ExecuteAsync(doc.RootElement);
+
+        Assert.True(result.IsError);
+        Assert.DoesNotContain("parameter is required", result.Content[0].Text, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("Error searching database objects", result.Content[0].Text, StringComparison.OrdinalIgnoreCase);
+    }
 }

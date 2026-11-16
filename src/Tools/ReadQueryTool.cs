@@ -40,7 +40,12 @@ public class ReadQueryTool : IMcpToolHandler
                 query = new
                 {
                     type = "string",
-                    description = "The read-only SQL query to execute (SELECT / WITH CTE)."
+                    description = "The read-only SQL query to execute (SELECT / WITH CTE). Alias: 'sql'."
+                },
+                sql = new
+                {
+                    type = "string",
+                    description = "Alias for query."
                 },
                 max_rows = new
                 {
@@ -82,15 +87,23 @@ public class ReadQueryTool : IMcpToolHandler
     {
         if (!arguments.HasValue || arguments.Value.ValueKind != JsonValueKind.Object)
         {
-            return McpToolCallResult.Error("Arguments object is required with a 'query' property.");
+            return McpToolCallResult.Error("Arguments object is required with a 'query' or 'sql' property.");
         }
 
-        if (!arguments.Value.TryGetProperty("query", out var qProp) || string.IsNullOrWhiteSpace(qProp.GetString()))
+        string? rawQuery = null;
+        if (arguments.Value.TryGetProperty("query", out var qProp) && !string.IsNullOrWhiteSpace(qProp.GetString()))
         {
-            return McpToolCallResult.Error("The 'query' parameter is required.");
+            rawQuery = qProp.GetString()!.Trim();
+        }
+        else if (arguments.Value.TryGetProperty("sql", out var sqlProp) && !string.IsNullOrWhiteSpace(sqlProp.GetString()))
+        {
+            rawQuery = sqlProp.GetString()!.Trim();
         }
 
-        string rawQuery = qProp.GetString()!.Trim();
+        if (string.IsNullOrWhiteSpace(rawQuery))
+        {
+            return McpToolCallResult.Error("The 'query' (or 'sql') parameter is required.");
+        }
 
         // Validate query safety through guardrails
         var safety = _validator.ValidateReadQuery(rawQuery);

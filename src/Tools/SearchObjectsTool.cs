@@ -25,7 +25,7 @@ public class SearchObjectsTool : IMcpToolHandler
     public McpToolDefinition Definition => new()
     {
         Name = "search_objects",
-        Description = "Searches for database objects (tables, views, stored procedures, functions) matching a pattern or list of patterns in the active or specified database. Supports aliases 'search', 'query', 'object_types', 'types', 'type'.",
+        Description = "Searches for database objects (tables, views, stored procedures, functions, columns) matching a pattern or list of patterns in the active or specified database. Supports aliases 'search', 'query', 'column_pattern', 'column', 'object_types', 'types', 'type'.",
         InputSchema = new
         {
             type = "object",
@@ -42,6 +42,21 @@ public class SearchObjectsTool : IMcpToolHandler
                     items = new { type = "string" },
                     description = "Optional list of multiple search patterns to match (OR logic)."
                 },
+                column_pattern = new
+                {
+                    type = "string",
+                    description = "Search pattern for column names across tables/views (e.g. '%email%' or '%nit%'). Automatically enables column search. Aliases: 'column', 'col_pattern'."
+                },
+                column = new
+                {
+                    type = "string",
+                    description = "Alias for column_pattern."
+                },
+                col_pattern = new
+                {
+                    type = "string",
+                    description = "Alias for column_pattern."
+                },
                 search = new
                 {
                     type = "string",
@@ -55,14 +70,14 @@ public class SearchObjectsTool : IMcpToolHandler
                 object_type = new
                 {
                     type = "string",
-                    description = "Type of object to filter: 'TABLE', 'VIEW', 'PROCEDURE', 'FUNCTION', or 'ALL' (default 'ALL'). Alias: 'type'. Accepts abbreviations (e.g. 'P', 'U', 'V', 'FN').",
-                    @enum = new[] { "TABLE", "VIEW", "PROCEDURE", "FUNCTION", "ALL" }
+                    description = "Type of object to filter: 'TABLE', 'VIEW', 'PROCEDURE', 'FUNCTION', 'COLUMN', or 'ALL' (default 'ALL'). Alias: 'type'. Accepts abbreviations (e.g. 'P', 'U', 'V', 'FN', 'COL').",
+                    @enum = new[] { "TABLE", "VIEW", "PROCEDURE", "FUNCTION", "COLUMN", "ALL" }
                 },
                 object_types = new
                 {
                     type = "array",
                     items = new { type = "string" },
-                    description = "Optional list of object types to filter (e.g. ['TABLE', 'PROCEDURE'] or ['U', 'P']). Alias: 'types'."
+                    description = "Optional list of object types to filter (e.g. ['TABLE', 'PROCEDURE'] or ['U', 'P', 'COLUMN']). Alias: 'types'."
                 },
                 type = new
                 {
@@ -156,6 +171,18 @@ public class SearchObjectsTool : IMcpToolHandler
             }
         }
 
+        // Check for 'column_pattern', 'column', 'col_pattern' aliases
+        bool hasColumnPattern = false;
+        string[] colPatternAliases = { "column_pattern", "column", "col_pattern" };
+        foreach (var alias in colPatternAliases)
+        {
+            if (arguments.Value.TryGetProperty(alias, out var cpProp))
+            {
+                ProcessPatternProperty(cpProp);
+                hasColumnPattern = true;
+            }
+        }
+
         if (patternList.Count == 0)
         {
             return McpToolCallResult.Error("Either 'pattern' or 'patterns' parameter is required.");
@@ -214,6 +241,16 @@ public class SearchObjectsTool : IMcpToolHandler
             }
         }
 
+        if (hasColumnPattern)
+        {
+            canonicalTypes.Add("COLUMN");
+        }
+
+        bool searchColumns = canonicalTypes.Contains("COLUMN");
+        bool searchObjects = canonicalTypes.Count == 0 ||
+                             canonicalTypes.Contains("ALL") ||
+                             canonicalTypes.Any(t => !string.Equals(t, "COLUMN", StringComparison.OrdinalIgnoreCase));
+
         bool includeRowCount = false;
         if (arguments.Value.TryGetProperty("include_row_count", out var rcProp) &&
             (rcProp.ValueKind == JsonValueKind.True || rcProp.ValueKind == JsonValueKind.False))
@@ -235,18 +272,22 @@ public class SearchObjectsTool : IMcpToolHandler
         {
             await using var connection = await _connectionManager.OpenConnectionAsync(profile, database, cancellationToken);
 
-            // Build dynamic pattern predicate
-            var patternPredicates = new List<string>();
-            for (int i = 0; i < patternList.Count; i++)
+            var results = new List<object>();
+
+            if (searchObjects)
             {
-                patternPredicates.Add($"o.name LIKE @Pattern_{i}");
-            }
-            string patternClause = string.Join(" OR ", patternPredicates);
+                // Build dynamic pattern predicate
+                var patternPredicates = new List<string>();
+                for (int i = 0; i < patternList.Count; i++)
+                {
+                    patternPredicates.Add($"o.name LIKE @Pattern_{i}");
+                }
+                string patternClause = string.Join(" OR ", patternPredicates);
 
-            string typeClause = BuildTypeClause(canonicalTypes);
+                string typeClause = BuildTypeClause(canonicalTypes);
 
-            string rowCountSelect = includeRowCount ? ", ps.row_count" : "";
-            string rowCountJoin = includeRowCount ? @"
+                string rowCountSelect = includeRowCount ? ", ps.row_count" : "";
+                string rowCountJoin = includeRowCount ? @"
 LEFT JOIN (
     SELECT object_id, SUM(rows) AS row_count
     FROM sys.partitions
@@ -254,7 +295,7 @@ LEFT JOIN (
     GROUP BY object_id
 ) ps ON o.object_id = ps.object_id" : "";
 
-            string sql = $@"
+                string sql = $@"
 SELECT 
     s.name AS schema_name,
     o.name AS object_name,
@@ -277,64 +318,127 @@ WHERE o.is_ms_shipped = 0
   AND ({patternClause})
 ORDER BY s.name, o.name;";
 
-            await using var cmd = new SqlCommand(sql, connection);
-            for (int i = 0; i < patternList.Count; i++)
-            {
-                cmd.Parameters.Add(new SqlParameter($"@Pattern_{i}", SqlDbType.NVarChar, 200) { Value = patternList[i] });
-            }
-
-            var results = new List<object>();
-            await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
-            while (await reader.ReadAsync(cancellationToken))
-            {
-                string schemaName = reader.GetString(0);
-                string objectNameVal = reader.GetString(1);
-                string typeVal = reader.GetString(2);
-                DateTime createDate = reader.GetDateTime(3);
-                DateTime modifyDate = reader.GetDateTime(4);
-                long? rowCount = null;
-                if (includeRowCount && typeVal == "TABLE" && !reader.IsDBNull(5))
+                await using var cmd = new SqlCommand(sql, connection);
+                for (int i = 0; i < patternList.Count; i++)
                 {
-                    rowCount = reader.GetInt64(5);
+                    cmd.Parameters.Add(new SqlParameter($"@Pattern_{i}", SqlDbType.NVarChar, 200) { Value = patternList[i] });
                 }
 
-                // If it's a table, verify it's not restricted by DeniedTables
-                if (typeVal == "TABLE")
+                await using var reader = await cmd.ExecuteReaderAsync(cancellationToken);
+                while (await reader.ReadAsync(cancellationToken))
                 {
+                    string schemaName = reader.GetString(0);
+                    string objectNameVal = reader.GetString(1);
+                    string typeVal = reader.GetString(2);
+                    DateTime createDate = reader.GetDateTime(3);
+                    DateTime modifyDate = reader.GetDateTime(4);
+                    long? rowCount = null;
+                    if (includeRowCount && typeVal == "TABLE" && !reader.IsDBNull(5))
+                    {
+                        rowCount = reader.GetInt64(5);
+                    }
+
+                    // If it's a table, verify it's not restricted by DeniedTables
+                    if (typeVal == "TABLE")
+                    {
+                        try
+                        {
+                            _validator.ValidateTable($"{schemaName}.{objectNameVal}");
+                        }
+                        catch
+                        {
+                            // Skip denied tables from search output
+                            continue;
+                        }
+                    }
+
+                    if (includeRowCount)
+                    {
+                        results.Add(new
+                        {
+                            schema = schemaName,
+                            name = objectNameVal,
+                            fullName = $"{schemaName}.{objectNameVal}",
+                            type = typeVal,
+                            rowCount,
+                            created = createDate.ToString("yyyy-MM-dd HH:mm:ss"),
+                            modified = modifyDate.ToString("yyyy-MM-dd HH:mm:ss")
+                        });
+                    }
+                    else
+                    {
+                        results.Add(new
+                        {
+                            schema = schemaName,
+                            name = objectNameVal,
+                            fullName = $"{schemaName}.{objectNameVal}",
+                            type = typeVal,
+                            created = createDate.ToString("yyyy-MM-dd HH:mm:ss"),
+                            modified = modifyDate.ToString("yyyy-MM-dd HH:mm:ss")
+                        });
+                    }
+                }
+            }
+
+            if (searchColumns)
+            {
+                var colPredicates = new List<string>();
+                for (int i = 0; i < patternList.Count; i++)
+                {
+                    colPredicates.Add($"c.name LIKE @ColPattern_{i}");
+                }
+                string colPatternClause = string.Join(" OR ", colPredicates);
+
+                string colSql = BuildColumnSearchSql(colPatternClause);
+
+                await using var cmdCol = new SqlCommand(colSql, connection);
+                for (int i = 0; i < patternList.Count; i++)
+                {
+                    cmdCol.Parameters.Add(new SqlParameter($"@ColPattern_{i}", SqlDbType.NVarChar, 200) { Value = patternList[i] });
+                }
+
+                await using var readerCol = await cmdCol.ExecuteReaderAsync(cancellationToken);
+                while (await readerCol.ReadAsync(cancellationToken))
+                {
+                    string schemaName = readerCol.GetString(0);
+                    string tableName = readerCol.GetString(1);
+                    string parentType = readerCol.GetString(2);
+                    string colName = readerCol.GetString(3);
+                    string dataTypeName = readerCol.GetString(4);
+                    short maxLen = readerCol.GetInt16(5);
+                    byte prec = readerCol.GetByte(6);
+                    byte scale = readerCol.GetByte(7);
+                    bool isNullable = readerCol.GetBoolean(8);
+                    bool isIdentity = readerCol.GetBoolean(9);
+
+                    // Skip denied tables
                     try
                     {
-                        _validator.ValidateTable($"{schemaName}.{objectNameVal}");
+                        _validator.ValidateTable($"{schemaName}.{tableName}");
                     }
                     catch
                     {
-                        // Skip denied tables from search output
                         continue;
                     }
-                }
 
-                if (includeRowCount)
-                {
+                    bool isRestricted = _validator.IsColumnDenied(colName);
+
                     results.Add(new
                     {
                         schema = schemaName,
-                        name = objectNameVal,
-                        fullName = $"{schemaName}.{objectNameVal}",
-                        type = typeVal,
-                        rowCount,
-                        created = createDate.ToString("yyyy-MM-dd HH:mm:ss"),
-                        modified = modifyDate.ToString("yyyy-MM-dd HH:mm:ss")
-                    });
-                }
-                else
-                {
-                    results.Add(new
-                    {
-                        schema = schemaName,
-                        name = objectNameVal,
-                        fullName = $"{schemaName}.{objectNameVal}",
-                        type = typeVal,
-                        created = createDate.ToString("yyyy-MM-dd HH:mm:ss"),
-                        modified = modifyDate.ToString("yyyy-MM-dd HH:mm:ss")
+                        table = tableName,
+                        name = colName,
+                        column = colName,
+                        fullName = $"{schemaName}.{tableName}.{colName}",
+                        type = "COLUMN",
+                        parentType,
+                        dataType = dataTypeName,
+                        maxLength = maxLen,
+                        precision = prec,
+                        scale = scale,
+                        nullable = isNullable,
+                        isIdentity,
+                        isRestricted
                     });
                 }
             }
@@ -371,6 +475,7 @@ ORDER BY s.name, o.name;";
             "U" or "T" or "TABLE" or "TABLES" => "TABLE",
             "V" or "VIEW" or "VIEWS" => "VIEW",
             "FN" or "IF" or "TF" or "FUNC" or "FUNCTION" or "FUNCTIONS" => "FUNCTION",
+            "C" or "COL" or "COLUMN" or "COLUMNS" => "COLUMN",
             "ALL" or "*" => "ALL",
             _ => upper
         };
@@ -379,6 +484,8 @@ ORDER BY s.name, o.name;";
     internal static string BuildTypeClause(IEnumerable<string> canonicalTypes)
     {
         var typesSet = new HashSet<string>(canonicalTypes, StringComparer.OrdinalIgnoreCase);
+        typesSet.Remove("COLUMN");
+
         if (typesSet.Count == 0 || typesSet.Contains("ALL"))
         {
             return "1 = 1";
@@ -406,4 +513,29 @@ ORDER BY s.name, o.name;";
             ? $"({string.Join(" OR ", typeConditions)})"
             : "1 = 1";
     }
+
+    internal static string BuildColumnSearchSql(string colPatternClause) => $@"
+SELECT 
+    s.name AS schema_name,
+    o.name AS table_name,
+    CASE o.type
+        WHEN 'U' THEN 'TABLE'
+        WHEN 'V' THEN 'VIEW'
+        ELSE o.type_desc
+    END AS parent_type,
+    c.name AS column_name,
+    tp.name AS data_type,
+    c.max_length,
+    c.precision,
+    c.scale,
+    c.is_nullable,
+    c.is_identity
+FROM sys.columns c
+INNER JOIN sys.objects o ON c.object_id = o.object_id
+INNER JOIN sys.schemas s ON o.schema_id = s.schema_id
+INNER JOIN sys.types tp ON c.user_type_id = tp.user_type_id
+WHERE o.is_ms_shipped = 0
+  AND o.type IN ('U', 'V')
+  AND ({colPatternClause})
+ORDER BY s.name, o.name, c.column_id;";
 }

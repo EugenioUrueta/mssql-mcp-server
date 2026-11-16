@@ -18,6 +18,41 @@ public class GetTableSchemaTool : IMcpToolHandler
     private readonly GuardrailsValidator _validator;
     private readonly ConcurrentDictionary<string, (object Result, DateTime Expiry)> _schemaCache = new(StringComparer.OrdinalIgnoreCase);
 
+    internal const string IncomingFkSql = @"
+SELECT 
+    fk.name AS fk_name,
+    OBJECT_SCHEMA_NAME(fk.parent_object_id) AS child_schema,
+    OBJECT_NAME(fk.parent_object_id) AS child_table,
+    cp.name AS child_column,
+    cr.name AS ref_column
+FROM sys.foreign_keys fk
+INNER JOIN sys.foreign_key_columns fkc ON fk.object_id = fkc.constraint_object_id
+INNER JOIN sys.columns cp ON fkc.parent_object_id = cp.object_id AND fkc.parent_column_id = cp.column_id
+INNER JOIN sys.columns cr ON fkc.referenced_object_id = cr.object_id AND fkc.referenced_column_id = cr.column_id
+INNER JOIN sys.tables t ON fk.referenced_object_id = t.object_id
+INNER JOIN sys.schemas s ON t.schema_id = s.schema_id
+WHERE s.name = @SchemaName AND t.name = @TableName
+ORDER BY fk.name, fkc.constraint_column_id;";
+
+    internal const string IndexesSql = @"
+SELECT 
+    i.name AS index_name,
+    i.type_desc,
+    i.is_unique,
+    i.is_primary_key,
+    STUFF((
+        SELECT ', ' + c2.name
+        FROM sys.index_columns ic2
+        INNER JOIN sys.columns c2 ON ic2.object_id = c2.object_id AND ic2.column_id = c2.column_id
+        WHERE ic2.object_id = i.object_id AND ic2.index_id = i.index_id
+        ORDER BY ic2.key_ordinal
+        FOR XML PATH(''), TYPE
+    ).value('.', 'NVARCHAR(MAX)'), 1, 2, '') AS columns
+FROM sys.indexes i
+INNER JOIN sys.tables t ON i.object_id = t.object_id
+INNER JOIN sys.schemas s ON t.schema_id = s.schema_id
+WHERE s.name = @SchemaName AND t.name = @TableName AND i.is_primary_key = 0 AND i.type > 0;";
+
     public GetTableSchemaTool(InstanceConnectionManager connectionManager, GuardrailsValidator validator)
     {
         _connectionManager = connectionManager;
@@ -27,7 +62,7 @@ public class GetTableSchemaTool : IMcpToolHandler
     public McpToolDefinition Definition => new()
     {
         Name = "get_table_schema",
-        Description = "Retrieves comprehensive schema information for one or more tables: columns, data types, nullability, identity, default values, primary keys, foreign keys, and indexes. Supports single table or batch mode, compact format, and aliases 'table', 'name', 'tables', 'names'.",
+        Description = "Retrieves comprehensive schema information for one or more tables: columns, data types, nullability, identity, default values, primary keys, foreign keys (outgoing and incoming/referenced_by), indexes, and optional sample rows preview. Supports single table or batch mode, compact format, and aliases 'table', 'name', 'tables', 'names', 'sample_rows', 'sample'.",
         InputSchema = new
         {
             type = "object",
@@ -70,6 +105,21 @@ public class GetTableSchemaTool : IMcpToolHandler
                 {
                     type = "boolean",
                     description = "Whether to return a compact summary schema (omitting verbose column attributes and raw index details). Default is false."
+                },
+                sample_rows = new
+                {
+                    type = "integer",
+                    description = "Optional number of sample rows (0 to 5, default 0) to preview actual data in the table. Aliases: 'sample', 'samples'."
+                },
+                sample = new
+                {
+                    type = "integer",
+                    description = "Alias for sample_rows."
+                },
+                samples = new
+                {
+                    type = "integer",
+                    description = "Alias for sample_rows."
                 },
                 profile = new
                 {
@@ -180,6 +230,17 @@ public class GetTableSchemaTool : IMcpToolHandler
             compact = cmpProp.GetBoolean();
         }
 
+        int sampleRows = 0;
+        string[] sampleAliases = { "sample_rows", "sample", "samples" };
+        foreach (var alias in sampleAliases)
+        {
+            if (arguments.Value.TryGetProperty(alias, out var srProp) && srProp.TryGetInt32(out int srVal))
+            {
+                sampleRows = Math.Clamp(srVal, 0, 5);
+                break;
+            }
+        }
+
         bool indent = false;
         if (arguments.Value.TryGetProperty("indent", out var indProp) &&
             (indProp.ValueKind == JsonValueKind.True || indProp.ValueKind == JsonValueKind.False))
@@ -213,7 +274,7 @@ public class GetTableSchemaTool : IMcpToolHandler
                     tableName = parts[1];
                 }
 
-                var (schemaObj, error) = await GetSingleTableSchemaAsync(connection, schemaName, tableName, compact, noCache, cancellationToken);
+                var (schemaObj, error) = await GetSingleTableSchemaAsync(connection, schemaName, tableName, compact, noCache, sampleRows, cancellationToken);
                 if (error != null)
                 {
                     if (tableList.Count == 1)
@@ -246,7 +307,10 @@ public class GetTableSchemaTool : IMcpToolHandler
                     primaryKey = ((dynamic)single).primaryKey,
                     columns = ((dynamic)single).columns,
                     foreignKeys = ((dynamic)single).foreignKeys,
-                    indexes = compact ? null : ((dynamic)single).indexes
+                    referencedBy = ((dynamic)single).referencedBy,
+                    incomingForeignKeys = ((dynamic)single).incomingForeignKeys,
+                    indexes = compact ? null : ((dynamic)single).indexes,
+                    sampleRows = ((dynamic)single).sampleRows
                 };
 
                 return McpToolCallResult.Success(JsonSerializer.Serialize(singleWithDb, new JsonSerializerOptions { WriteIndented = indent }));
@@ -274,9 +338,10 @@ public class GetTableSchemaTool : IMcpToolHandler
         string tableName,
         bool compact,
         bool noCache,
+        int sampleRows,
         CancellationToken cancellationToken)
     {
-        string cacheKey = $"{connection.Database}:{schemaName}.{tableName}:{(compact ? "compact" : "full")}";
+        string cacheKey = $"{connection.Database}:{schemaName}.{tableName}:{(compact ? "compact" : "full")}:sr{sampleRows}";
         if (!noCache && _schemaCache.TryGetValue(cacheKey, out var cached) && DateTime.UtcNow < cached.Expiry)
         {
             return (cached.Result, null);
@@ -361,6 +426,26 @@ WHERE s.name = @SchemaName AND t.name = @TableName;";
             }
         }
 
+        // 2b. Incoming Foreign Keys query (tables referencing this table)
+        await using var cmdInFk = new SqlCommand(IncomingFkSql, connection);
+        cmdInFk.Parameters.Add(new SqlParameter("@SchemaName", SqlDbType.NVarChar, 128) { Value = schemaName });
+        cmdInFk.Parameters.Add(new SqlParameter("@TableName", SqlDbType.NVarChar, 128) { Value = tableName });
+
+        var incomingForeignKeys = new List<object>();
+        await using (var reader = await cmdInFk.ExecuteReaderAsync(cancellationToken))
+        {
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                incomingForeignKeys.Add(new
+                {
+                    name = reader.GetString(0),
+                    childTable = $"{reader.GetString(1)}.{reader.GetString(2)}",
+                    childColumn = reader.GetString(3),
+                    referencedColumn = reader.GetString(4)
+                });
+            }
+        }
+
         // 3. Columns query
         const string columnsSql = @"
 SELECT 
@@ -431,26 +516,11 @@ ORDER BY c.column_id;";
             return (null, $"Table '{schemaName}.{tableName}' was not found in database '{connection.Database}'.");
         }
 
-        // 4. Indexes query
+        // 4. Indexes query (SQL Server 2008+ compatible using STUFF FOR XML PATH)
         var indexes = new List<object>();
         if (!compact)
         {
-            const string idxSql = @"
-SELECT 
-    i.name AS index_name,
-    i.type_desc,
-    i.is_unique,
-    i.is_primary_key,
-    STRING_AGG(c.name, ', ') WITHIN GROUP (ORDER BY ic.key_ordinal) AS columns
-FROM sys.indexes i
-INNER JOIN sys.index_columns ic ON i.object_id = ic.object_id AND i.index_id = ic.index_id
-INNER JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id
-INNER JOIN sys.tables t ON i.object_id = t.object_id
-INNER JOIN sys.schemas s ON t.schema_id = s.schema_id
-WHERE s.name = @SchemaName AND t.name = @TableName AND i.is_primary_key = 0 AND i.type > 0
-GROUP BY i.name, i.type_desc, i.is_unique, i.is_primary_key;";
-
-            await using var cmdIdx = new SqlCommand(idxSql, connection);
+            await using var cmdIdx = new SqlCommand(IndexesSql, connection);
             cmdIdx.Parameters.Add(new SqlParameter("@SchemaName", SqlDbType.NVarChar, 128) { Value = schemaName });
             cmdIdx.Parameters.Add(new SqlParameter("@TableName", SqlDbType.NVarChar, 128) { Value = tableName });
 
@@ -463,9 +533,48 @@ GROUP BY i.name, i.type_desc, i.is_unique, i.is_primary_key;";
                         name = reader.GetString(0),
                         type = reader.GetString(1),
                         isUnique = reader.GetBoolean(2),
-                        columns = reader.GetString(4)
+                        columns = reader.IsDBNull(4) ? "" : reader.GetString(4)
                     });
                 }
+            }
+        }
+
+        // 5. Sample Rows preview (if sample_rows > 0)
+        List<Dictionary<string, object?>>? sampleData = null;
+        if (sampleRows > 0)
+        {
+            sampleData = new List<Dictionary<string, object?>>();
+            try
+            {
+                string escapedSchema = schemaName.Replace("]", "]]");
+                string escapedTable = tableName.Replace("]", "]]");
+                string sampleSql = $"SELECT TOP (@SampleCount) * FROM [{escapedSchema}].[{escapedTable}];";
+
+                await using var cmdSample = new SqlCommand(sampleSql, connection);
+                cmdSample.Parameters.Add(new SqlParameter("@SampleCount", SqlDbType.Int) { Value = sampleRows });
+
+                await using var sampleReader = await cmdSample.ExecuteReaderAsync(cancellationToken);
+                while (await sampleReader.ReadAsync(cancellationToken))
+                {
+                    var row = new Dictionary<string, object?>();
+                    for (int i = 0; i < sampleReader.FieldCount; i++)
+                    {
+                        string colName = sampleReader.GetName(i);
+                        if (_validator.IsColumnDenied(colName))
+                        {
+                            row[colName] = "***RESTRICTED***";
+                        }
+                        else
+                        {
+                            row[colName] = sampleReader.IsDBNull(i) ? null : sampleReader.GetValue(i);
+                        }
+                    }
+                    sampleData.Add(row);
+                }
+            }
+            catch
+            {
+                // Graceful fallback if sample rows preview fails
             }
         }
 
@@ -477,7 +586,10 @@ GROUP BY i.name, i.type_desc, i.is_unique, i.is_primary_key;";
                 fullName = $"{schemaName}.{tableName}",
                 primaryKey = pkName != null ? new { name = pkName, columns = pkColumns } : null,
                 columns,
-                foreignKeys
+                foreignKeys,
+                referencedBy = incomingForeignKeys,
+                incomingForeignKeys,
+                sampleRows = sampleData
             }
             : new
             {
@@ -487,7 +599,10 @@ GROUP BY i.name, i.type_desc, i.is_unique, i.is_primary_key;";
                 primaryKey = pkName != null ? new { name = pkName, columns = pkColumns } : null,
                 columns,
                 foreignKeys,
-                indexes
+                referencedBy = incomingForeignKeys,
+                incomingForeignKeys,
+                indexes,
+                sampleRows = sampleData
             };
 
         _schemaCache[cacheKey] = (result, DateTime.UtcNow.AddMinutes(5));
