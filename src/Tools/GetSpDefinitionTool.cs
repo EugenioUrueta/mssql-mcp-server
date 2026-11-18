@@ -26,6 +26,8 @@ public class StoredProcedureInfo
 
 public class GetSpDefinitionTool : IMcpToolHandler
 {
+    internal const string ProtectedSpComment = "-- [PROTECTED: Stored procedure definition is encrypted with WITH ENCRYPTION]";
+
     private readonly InstanceConnectionManager _connectionManager;
     private readonly GuardrailsValidator? _validator;
 
@@ -389,9 +391,11 @@ WHERE s.name = @SchemaName AND o.name = @SpName;";
         {
             if (await reader.ReadAsync(cancellationToken))
             {
-                definition = reader.GetString(0);
-                created = reader.GetDateTime(1);
-                modified = reader.GetDateTime(2);
+                definition = reader.IsDBNull(0)
+                    ? ProtectedSpComment
+                    : reader.GetString(0);
+                created = reader.IsDBNull(1) ? null : reader.GetDateTime(1);
+                modified = reader.IsDBNull(2) ? null : reader.GetDateTime(2);
             }
         }
 

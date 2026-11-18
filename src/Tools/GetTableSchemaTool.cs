@@ -16,7 +16,7 @@ public class GetTableSchemaTool : IMcpToolHandler
 {
     private readonly InstanceConnectionManager _connectionManager;
     private readonly GuardrailsValidator _validator;
-    private readonly ConcurrentDictionary<string, (object Result, DateTime Expiry)> _schemaCache = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, (TableSchemaInfo Result, DateTime Expiry)> _schemaCache = new(StringComparer.OrdinalIgnoreCase);
 
     internal const string IncomingFkSql = @"
 SELECT 
@@ -298,21 +298,8 @@ WHERE s.name = @SchemaName AND t.name = @TableName AND i.is_primary_key = 0 AND 
             if (tableList.Count == 1 && tableResults.Count == 1 && !isBatchRequest)
             {
                 // Single table backwards-compatible format
-                var single = tableResults[0];
-                var singleWithDb = new
-                {
-                    database = connection.Database,
-                    schema = ((dynamic)single).schema,
-                    table = ((dynamic)single).table,
-                    fullName = ((dynamic)single).fullName,
-                    primaryKey = ((dynamic)single).primaryKey,
-                    columns = ((dynamic)single).columns,
-                    foreignKeys = ((dynamic)single).foreignKeys,
-                    referencedBy = ((dynamic)single).referencedBy,
-                    incomingForeignKeys = ((dynamic)single).incomingForeignKeys,
-                    indexes = compact ? null : ((dynamic)single).indexes,
-                    sampleRows = ((dynamic)single).sampleRows
-                };
+                var single = (TableSchemaInfo)tableResults[0];
+                var singleWithDb = single.CloneWithDatabase(connection.Database);
 
                 return McpToolCallResult.Success(JsonSerializer.Serialize(singleWithDb, new JsonSerializerOptions { WriteIndented = indent }));
             }
@@ -333,7 +320,7 @@ WHERE s.name = @SchemaName AND t.name = @TableName AND i.is_primary_key = 0 AND 
         }
     }
 
-    private async Task<(object? TableResult, string? Error)> GetSingleTableSchemaAsync(
+    private async Task<(TableSchemaInfo? TableResult, string? Error)> GetSingleTableSchemaAsync(
         SqlConnection connection,
         string schemaName,
         string tableName,
@@ -397,7 +384,7 @@ WHERE s.name = @SchemaName AND t.name = @TableName;";
         cmdFk.Parameters.Add(new SqlParameter("@SchemaName", SqlDbType.NVarChar, 128) { Value = schemaName });
         cmdFk.Parameters.Add(new SqlParameter("@TableName", SqlDbType.NVarChar, 128) { Value = tableName });
 
-        var foreignKeys = new List<object>();
+        var foreignKeys = new List<ForeignKeyInfo>();
         var fkColumnNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         await using (var reader = await cmdFk.ExecuteReaderAsync(cancellationToken))
         {
@@ -407,21 +394,21 @@ WHERE s.name = @SchemaName AND t.name = @TableName;";
                 fkColumnNames.Add(col);
                 if (compact)
                 {
-                    foreignKeys.Add(new
+                    foreignKeys.Add(new ForeignKeyInfo
                     {
-                        name = reader.GetString(0),
-                        column = col,
-                        references = $"{reader.GetString(2)}.{reader.GetString(3)}.{reader.GetString(4)}"
+                        Name = reader.GetString(0),
+                        Column = col,
+                        References = $"{reader.GetString(2)}.{reader.GetString(3)}.{reader.GetString(4)}"
                     });
                 }
                 else
                 {
-                    foreignKeys.Add(new
+                    foreignKeys.Add(new ForeignKeyInfo
                     {
-                        name = reader.GetString(0),
-                        column = col,
-                        referencedTable = $"{reader.GetString(2)}.{reader.GetString(3)}",
-                        referencedColumn = reader.GetString(4)
+                        Name = reader.GetString(0),
+                        Column = col,
+                        ReferencedTable = $"{reader.GetString(2)}.{reader.GetString(3)}",
+                        ReferencedColumn = reader.GetString(4)
                     });
                 }
             }
@@ -432,17 +419,17 @@ WHERE s.name = @SchemaName AND t.name = @TableName;";
         cmdInFk.Parameters.Add(new SqlParameter("@SchemaName", SqlDbType.NVarChar, 128) { Value = schemaName });
         cmdInFk.Parameters.Add(new SqlParameter("@TableName", SqlDbType.NVarChar, 128) { Value = tableName });
 
-        var incomingForeignKeys = new List<object>();
+        var incomingForeignKeys = new List<IncomingForeignKeyInfo>();
         await using (var reader = await cmdInFk.ExecuteReaderAsync(cancellationToken))
         {
             while (await reader.ReadAsync(cancellationToken))
             {
-                incomingForeignKeys.Add(new
+                incomingForeignKeys.Add(new IncomingForeignKeyInfo
                 {
-                    name = reader.GetString(0),
-                    childTable = $"{reader.GetString(1)}.{reader.GetString(2)}",
-                    childColumn = reader.GetString(3),
-                    referencedColumn = reader.GetString(4)
+                    Name = reader.GetString(0),
+                    ChildTable = $"{reader.GetString(1)}.{reader.GetString(2)}",
+                    ChildColumn = reader.GetString(3),
+                    ReferencedColumn = reader.GetString(4)
                 });
             }
         }
@@ -470,7 +457,7 @@ ORDER BY c.column_id;";
         cmdCols.Parameters.Add(new SqlParameter("@SchemaName", SqlDbType.NVarChar, 128) { Value = schemaName });
         cmdCols.Parameters.Add(new SqlParameter("@TableName", SqlDbType.NVarChar, 128) { Value = tableName });
 
-        var columns = new List<object>();
+        var columns = new List<ColumnSchemaInfo>();
         await using (var reader = await cmdCols.ExecuteReaderAsync(cancellationToken))
         {
             while (await reader.ReadAsync(cancellationToken))
@@ -482,31 +469,31 @@ ORDER BY c.column_id;";
 
                 if (compact)
                 {
-                    columns.Add(new
+                    columns.Add(new ColumnSchemaInfo
                     {
-                        name = colName,
-                        type = reader.GetString(2),
-                        nullable = reader.GetBoolean(6),
-                        isPrimaryKey = isPk,
-                        isForeignKey = isFk,
-                        isIdentity = reader.GetBoolean(7),
-                        isRestricted
+                        Name = colName,
+                        Type = reader.GetString(2),
+                        Nullable = reader.GetBoolean(6),
+                        IsPrimaryKey = isPk,
+                        IsForeignKey = isFk,
+                        IsIdentity = reader.GetBoolean(7),
+                        IsRestricted = isRestricted
                     });
                 }
                 else
                 {
-                    columns.Add(new
+                    columns.Add(new ColumnSchemaInfo
                     {
-                        columnId = reader.GetInt32(0),
-                        name = colName,
-                        dataType = reader.GetString(2),
-                        maxLength = reader.GetInt16(3),
-                        precision = reader.GetByte(4),
-                        scale = reader.GetByte(5),
-                        isNullable = reader.GetBoolean(6),
-                        isIdentity = reader.GetBoolean(7),
-                        defaultValue = reader.IsDBNull(8) ? null : reader.GetString(8),
-                        isRestricted
+                        ColumnId = reader.GetInt32(0),
+                        Name = colName,
+                        DataType = reader.GetString(2),
+                        MaxLength = reader.GetInt16(3),
+                        Precision = reader.GetByte(4),
+                        Scale = reader.GetByte(5),
+                        IsNullable = reader.GetBoolean(6),
+                        IsIdentity = reader.GetBoolean(7),
+                        DefaultValue = reader.IsDBNull(8) ? null : reader.GetString(8),
+                        IsRestricted = isRestricted
                     });
                 }
             }
@@ -518,7 +505,7 @@ ORDER BY c.column_id;";
         }
 
         // 4. Indexes query (SQL Server 2008+ compatible using STUFF FOR XML PATH)
-        var indexes = new List<object>();
+        var indexes = new List<IndexInfo>();
         if (!compact)
         {
             await using var cmdIdx = new SqlCommand(IndexesSql, connection);
@@ -529,12 +516,12 @@ ORDER BY c.column_id;";
             {
                 while (await reader.ReadAsync(cancellationToken))
                 {
-                    indexes.Add(new
+                    indexes.Add(new IndexInfo
                     {
-                        name = reader.GetString(0),
-                        type = reader.GetString(1),
-                        isUnique = reader.GetBoolean(2),
-                        columns = reader.IsDBNull(4) ? "" : reader.GetString(4)
+                        Name = reader.GetString(0),
+                        Type = reader.GetString(1),
+                        IsUnique = reader.GetBoolean(2),
+                        Columns = reader.IsDBNull(4) ? "" : reader.GetString(4)
                     });
                 }
             }
@@ -579,32 +566,19 @@ ORDER BY c.column_id;";
             }
         }
 
-        object result = compact
-            ? new
-            {
-                schema = schemaName,
-                table = tableName,
-                fullName = $"{schemaName}.{tableName}",
-                primaryKey = pkName != null ? new { name = pkName, columns = pkColumns } : null,
-                columns,
-                foreignKeys,
-                referencedBy = incomingForeignKeys,
-                incomingForeignKeys,
-                sampleRows = sampleData
-            }
-            : new
-            {
-                schema = schemaName,
-                table = tableName,
-                fullName = $"{schemaName}.{tableName}",
-                primaryKey = pkName != null ? new { name = pkName, columns = pkColumns } : null,
-                columns,
-                foreignKeys,
-                referencedBy = incomingForeignKeys,
-                incomingForeignKeys,
-                indexes,
-                sampleRows = sampleData
-            };
+        TableSchemaInfo result = new()
+        {
+            Schema = schemaName,
+            Table = tableName,
+            FullName = $"{schemaName}.{tableName}",
+            PrimaryKey = pkName != null ? new PrimaryKeyInfo { Name = pkName, Columns = pkColumns } : null,
+            Columns = columns,
+            ForeignKeys = foreignKeys,
+            ReferencedBy = incomingForeignKeys,
+            IncomingForeignKeys = incomingForeignKeys,
+            Indexes = compact ? null : indexes,
+            SampleRows = sampleData
+        };
 
         _schemaCache[cacheKey] = (result, DateTime.UtcNow.AddMinutes(5));
 

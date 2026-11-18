@@ -1264,4 +1264,211 @@ public class ToolExecutionTests
         bool isDenied = _validator.IsColumnDenied(columnName);
         Assert.Equal(expectedDenied, isDenied);
     }
+
+    [Fact]
+    public void TableSchemaInfo_CompactSerialization_MatchesSchema()
+    {
+        var schema = new TableSchemaInfo
+        {
+            Schema = "dbo",
+            Table = "orders",
+            FullName = "dbo.orders",
+            PrimaryKey = new PrimaryKeyInfo
+            {
+                Name = "PK_orders",
+                Columns = new List<string> { "order_id" }
+            },
+            Columns = new List<ColumnSchemaInfo>
+            {
+                new()
+                {
+                    Name = "order_id",
+                    Type = "int",
+                    Nullable = false,
+                    IsPrimaryKey = true,
+                    IsForeignKey = false,
+                    IsIdentity = true,
+                    IsRestricted = false
+                }
+            },
+            ForeignKeys = new List<ForeignKeyInfo>
+            {
+                new()
+                {
+                    Name = "FK_orders_customers",
+                    Column = "customer_id",
+                    References = "dbo.customers.customer_id"
+                }
+            },
+            IncomingForeignKeys = new List<IncomingForeignKeyInfo>
+            {
+                new()
+                {
+                    Name = "FK_order_items_orders",
+                    ChildTable = "dbo.order_items",
+                    ChildColumn = "order_id",
+                    ReferencedColumn = "order_id"
+                }
+            }
+        };
+
+        string json = JsonSerializer.Serialize(schema);
+        using var doc = JsonDocument.Parse(json);
+        var root = doc.RootElement;
+
+        // Null/omitted properties in compact mode
+        Assert.False(root.TryGetProperty("database", out _));
+        Assert.False(root.TryGetProperty("indexes", out _));
+
+        // Populated properties
+        Assert.Equal("dbo", root.GetProperty("schema").GetString());
+        Assert.Equal("orders", root.GetProperty("table").GetString());
+        Assert.Equal("dbo.orders", root.GetProperty("fullName").GetString());
+        Assert.Equal("PK_orders", root.GetProperty("primaryKey").GetProperty("name").GetString());
+
+        var col = root.GetProperty("columns")[0];
+        Assert.Equal("order_id", col.GetProperty("name").GetString());
+        Assert.Equal("int", col.GetProperty("type").GetString());
+        Assert.False(col.GetProperty("nullable").GetBoolean());
+        Assert.True(col.GetProperty("isPrimaryKey").GetBoolean());
+        Assert.False(col.TryGetProperty("columnId", out _));
+        Assert.False(col.TryGetProperty("dataType", out _));
+        Assert.False(col.TryGetProperty("maxLength", out _));
+
+        var fk = root.GetProperty("foreignKeys")[0];
+        Assert.Equal("FK_orders_customers", fk.GetProperty("name").GetString());
+        Assert.Equal("dbo.customers.customer_id", fk.GetProperty("references").GetString());
+        Assert.False(fk.TryGetProperty("referencedTable", out _));
+        Assert.False(fk.TryGetProperty("referencedColumn", out _));
+    }
+
+    [Fact]
+    public void TableSchemaInfo_CloneWithDatabase_SetsDatabaseWithoutMutatingOriginal()
+    {
+        var original = new TableSchemaInfo
+        {
+            Schema = "dbo",
+            Table = "customers",
+            FullName = "dbo.customers"
+        };
+
+        var cloned = original.CloneWithDatabase("app_db_dev");
+
+        Assert.Null(original.Database);
+        Assert.Equal("app_db_dev", cloned.Database);
+        Assert.Equal("dbo.customers", cloned.FullName);
+
+        string json = JsonSerializer.Serialize(cloned);
+        using var doc = JsonDocument.Parse(json);
+        Assert.Equal("app_db_dev", doc.RootElement.GetProperty("database").GetString());
+    }
+
+    [Fact]
+    public void ExecuteSpTool_ParamMetaSql_QueriesHasDefaultValue()
+    {
+        Assert.Contains("p.has_default_value", ExecuteSpTool.ParamMetaSql, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("sys.parameters", ExecuteSpTool.ParamMetaSql, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData("123456789.987654321", typeof(decimal))]
+    [InlineData("42", typeof(long))]
+    [InlineData("-9999999999", typeof(long))]
+    [InlineData("0.05", typeof(decimal))]
+    public void ExecuteSpTool_ConvertJsonElementToSqlValue_PreservesDecimalPrecision(string rawNum, Type expectedType)
+    {
+        using var doc = JsonDocument.Parse($$"""{"val": {{rawNum}}}""");
+        var elem = doc.RootElement.GetProperty("val");
+
+        object val = ExecuteSpTool.ConvertJsonElementToSqlValue(elem);
+        Assert.IsType(expectedType, val);
+        if (expectedType == typeof(decimal))
+        {
+            Assert.Equal(decimal.Parse(rawNum, System.Globalization.CultureInfo.InvariantCulture), (decimal)val);
+        }
+    }
+
+    [Fact]
+    public void GetSpDefinitionTool_ProtectedSpComment_HasClearDescription()
+    {
+        Assert.Contains("WITH ENCRYPTION", GetSpDefinitionTool.ProtectedSpComment, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("PROTECTED", GetSpDefinitionTool.ProtectedSpComment, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void TableSchemaInfo_FullModeSerialization_SerializesAllPropertiesAndIndexes()
+    {
+        var schema = new TableSchemaInfo
+        {
+            Database = "app_db_dev",
+            Schema = "dbo",
+            Table = "orders",
+            FullName = "dbo.orders",
+            PrimaryKey = new PrimaryKeyInfo
+            {
+                Name = "PK_orders",
+                Columns = new List<string> { "order_id" }
+            },
+            Columns = new List<ColumnSchemaInfo>
+            {
+                new()
+                {
+                    ColumnId = 1,
+                    Name = "order_id",
+                    DataType = "int",
+                    Type = "int",
+                    Nullable = false,
+                    MaxLength = 4,
+                    Precision = 10,
+                    Scale = 0,
+                    IsPrimaryKey = true,
+                    IsForeignKey = false,
+                    IsIdentity = true,
+                    IsRestricted = false
+                }
+            },
+            Indexes = new List<IndexInfo>
+            {
+                new()
+                {
+                    Name = "IX_orders_customer_id",
+                    Type = "NONCLUSTERED",
+                    IsUnique = false,
+                    Columns = "customer_id"
+                }
+            }
+        };
+
+        string json = JsonSerializer.Serialize(schema);
+        using var doc = JsonDocument.Parse(json);
+        var root = doc.RootElement;
+
+        Assert.Equal("app_db_dev", root.GetProperty("database").GetString());
+        Assert.Equal("dbo", root.GetProperty("schema").GetString());
+        Assert.Equal("orders", root.GetProperty("table").GetString());
+        Assert.Equal("dbo.orders", root.GetProperty("fullName").GetString());
+
+        var index = root.GetProperty("indexes")[0];
+        Assert.Equal("IX_orders_customer_id", index.GetProperty("name").GetString());
+        Assert.Equal("NONCLUSTERED", index.GetProperty("type").GetString());
+        Assert.False(index.GetProperty("isUnique").GetBoolean());
+
+        var col = root.GetProperty("columns")[0];
+        Assert.Equal(1, col.GetProperty("columnId").GetInt32());
+        Assert.Equal("int", col.GetProperty("dataType").GetString());
+        Assert.Equal(4, col.GetProperty("maxLength").GetInt32());
+        Assert.Equal(10, col.GetProperty("precision").GetInt32());
+    }
+
+    [Fact]
+    public void ExecuteSpTool_ConvertJsonElementToSqlValue_HandlesBooleanAndNull()
+    {
+        using var doc = JsonDocument.Parse("""{"bTrue": true, "bFalse": false, "str": "hello", "nullVal": null}""");
+        var root = doc.RootElement;
+
+        Assert.Equal(true, ExecuteSpTool.ConvertJsonElementToSqlValue(root.GetProperty("bTrue")));
+        Assert.Equal(false, ExecuteSpTool.ConvertJsonElementToSqlValue(root.GetProperty("bFalse")));
+        Assert.Equal("hello", ExecuteSpTool.ConvertJsonElementToSqlValue(root.GetProperty("str")));
+        Assert.Equal(DBNull.Value, ExecuteSpTool.ConvertJsonElementToSqlValue(root.GetProperty("nullVal")));
+    }
 }

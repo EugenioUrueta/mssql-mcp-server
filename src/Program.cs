@@ -112,7 +112,8 @@ public class Program
                 new GetSpDefinitionTool(connectionManager, validator),
                 new GetProcedureSignaturesTool(connectionManager, validator),
                 new ExecuteSpTool(connectionManager, validator),
-                new ReadQueryTool(connectionManager, validator, settings.Security)
+                new ReadQueryTool(connectionManager, validator, settings.Security),
+                new AnalyzeQueryTool(connectionManager, validator)
             };
 
             var toolRegistry = new ToolRegistry(tools);

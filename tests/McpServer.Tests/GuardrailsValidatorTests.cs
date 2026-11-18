@@ -466,4 +466,75 @@ public class GuardrailsValidatorTests
         var result = _validator.ValidateReadQuery(sql);
         Assert.True(result.IsSafe, $"Query '{sql}' was unexpectedly rejected: {result.ErrorMessage}");
     }
+
+    [Theory]
+    [InlineData("SELECT app_db.dbo.orders.order_id FROM orders")]
+    [InlineData("SELECT app_db.dbo.orders.order_id, app_db.dbo.orders.total FROM orders")]
+    [InlineData("SELECT app_db.dbo.orders.order_id FROM app_db.dbo.orders")]
+    [InlineData("SELECT [app_db].[dbo].[orders].[order_id] FROM [app_db].[dbo].[orders]")]
+    [InlineData("SELECT \"app_db\".\"dbo\".\"orders\".\"order_id\" FROM \"app_db\".\"dbo\".\"orders\"")]
+    [InlineData("SELECT a.id FROM orders a INNER JOIN customers b ON a.id = app_db.dbo.customers.customer_id")]
+    [InlineData("SELECT * FROM orders WHERE app_db.dbo.orders.order_id = 5")]
+    [InlineData("SELECT * FROM orders GROUP BY app_db.dbo.orders.customer_id")]
+    [InlineData("SELECT * FROM orders ORDER BY app_db.dbo.orders.created_at")]
+    [InlineData("SELECT * FROM orders HAVING COUNT(app_db.dbo.orders.order_id) > 1")]
+    [InlineData("SELECT (SELECT app_db.dbo.orders.order_id FROM orders) FROM audit_logs")]
+    [InlineData("WITH CTE AS (SELECT app_db.dbo.orders.order_id FROM orders) SELECT * FROM CTE")]
+    public void ValidateReadQuery_ShouldAllow_FourPartQualifiedColumnsInNonTableContexts(string sql)
+    {
+        var result = _validator.ValidateReadQuery(sql);
+        Assert.True(result.IsSafe, $"Query '{sql}' should have been allowed as 4-part qualified column, but got error: {result.ErrorMessage}");
+    }
+
+    [Theory]
+    [InlineData("SELECT app_db..orders.order_id FROM orders")]
+    [InlineData("SELECT app_db...order_id FROM orders")]
+    [InlineData("SELECT [app_db]..[orders].[order_id] FROM orders")]
+    [InlineData("SELECT [app_db]...[order_id] FROM orders")]
+    [InlineData("SELECT * FROM orders WHERE app_db...order_id = 1")]
+    public void ValidateReadQuery_ShouldReject_FourPartIdentifiersWithOmittedPartsEvenInSelectOrExpressions(string sql)
+    {
+        var result = _validator.ValidateReadQuery(sql);
+        Assert.False(result.IsSafe, $"Query '{sql}' should have been rejected for omitted parts.");
+        Assert.Contains("strictly prohibited by security guardrails", result.ErrorMessage, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData("SELECT * FROM remote_srv.app_db.dbo.orders")]
+    [InlineData("SELECT * FROM orders o INNER JOIN remote_srv.app_db.dbo.orders_ext e ON o.id = e.id")]
+    [InlineData("SELECT * FROM orders o CROSS APPLY remote_srv.app_db.dbo.orders_fn(o.id) f")]
+    [InlineData("SELECT * FROM orders o OUTER APPLY remote_srv.app_db.dbo.orders_fn(o.id) f")]
+    [InlineData("SELECT * FROM orders, remote_srv.app_db.dbo.customers")]
+    [InlineData("SELECT * FROM ((remote_srv.app_db.dbo.customers))")]
+    public void ValidateReadQuery_ShouldReject_FourPartNamesInTableSourceContexts(string sql)
+    {
+        var result = _validator.ValidateReadQuery(sql);
+        Assert.False(result.IsSafe, $"Query '{sql}' should have been rejected as a 4-part table source.");
+        Assert.Contains("Four-part object identifiers", result.ErrorMessage, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void WildcardMatcher_PatternCache_ShouldCacheAndMatchAccurately()
+    {
+        Assert.True(WildcardMatcher.IsMatch("orders_2026", "orders_*"));
+        Assert.True(WildcardMatcher.IsMatch("orders_2026", "orders_*")); // cached hit
+        Assert.True(WildcardMatcher.IsMatch("item_123", "item_???"));
+        Assert.False(WildcardMatcher.IsMatch("item_1234", "item_???"));
+        Assert.True(WildcardMatcher.MatchesAny("customer_token", new[] { "*secret*", "*token*" }));
+        Assert.False(WildcardMatcher.MatchesAny("customer_name", new[] { "*secret*", "*token*" }));
+    }
+
+    [Fact]
+    public void GuardrailsValidator_PrecompiledDeniedColumns_ShouldHandleEmptyAndCustomPatterns()
+    {
+        var emptySecurity = new GlobalSecurity { DeniedColumns = new List<string>() };
+        var emptyValidator = new GuardrailsValidator(emptySecurity);
+        Assert.False(emptyValidator.IsColumnDenied("Password"));
+
+        var customSecurity = new GlobalSecurity { DeniedColumns = new List<string> { "*Auth*", "SpecialKey" } };
+        var customValidator = new GuardrailsValidator(customSecurity);
+        Assert.True(customValidator.IsColumnDenied("UserAuthToken"));
+        Assert.True(customValidator.IsColumnDenied("SpecialKey"));
+        Assert.False(customValidator.IsColumnDenied("RegularColumn"));
+    }
 }

@@ -16,6 +16,21 @@ public class ExecuteSpTool : IMcpToolHandler
     private readonly InstanceConnectionManager _connectionManager;
     private readonly GuardrailsValidator _validator;
 
+    internal const string ParamMetaSql = @"
+SELECT 
+    p.name,
+    tp.name AS type_name,
+    p.is_output,
+    p.max_length,
+    p.precision,
+    p.scale,
+    p.has_default_value
+FROM sys.parameters p
+INNER JOIN sys.objects o ON p.object_id = o.object_id
+INNER JOIN sys.schemas s ON o.schema_id = s.schema_id
+INNER JOIN sys.types tp ON p.user_type_id = tp.user_type_id
+WHERE s.name = @SchemaName AND o.name = @SpName;";
+
     public ExecuteSpTool(InstanceConnectionManager connectionManager, GuardrailsValidator validator)
     {
         _connectionManager = connectionManager;
@@ -168,23 +183,9 @@ public class ExecuteSpTool : IMcpToolHandler
             try
             {
                 // Query parameter metadata from sys.parameters
-                const string paramMetaSql = @"
-SELECT 
-    p.name,
-    tp.name AS type_name,
-    p.is_output,
-    p.max_length,
-    p.precision,
-    p.scale
-FROM sys.parameters p
-INNER JOIN sys.objects o ON p.object_id = o.object_id
-INNER JOIN sys.schemas s ON o.schema_id = s.schema_id
-INNER JOIN sys.types tp ON p.user_type_id = tp.user_type_id
-WHERE s.name = @SchemaName AND o.name = @SpName;";
+                var paramMetaDict = new Dictionary<string, (string TypeName, bool IsOutput, int MaxLength, byte Precision, byte Scale, bool HasDefaultValue)>(StringComparer.OrdinalIgnoreCase);
 
-                var paramMetaDict = new Dictionary<string, (string TypeName, bool IsOutput, int MaxLength, byte Precision, byte Scale)>(StringComparer.OrdinalIgnoreCase);
-
-                await using (var cmdMeta = new SqlCommand(paramMetaSql, connection, transaction))
+                await using (var cmdMeta = new SqlCommand(ParamMetaSql, connection, transaction))
                 {
                     cmdMeta.Parameters.Add(new SqlParameter("@SchemaName", SqlDbType.NVarChar, 128) { Value = schemaName });
                     cmdMeta.Parameters.Add(new SqlParameter("@SpName", SqlDbType.NVarChar, 128) { Value = spName });
@@ -198,7 +199,8 @@ WHERE s.name = @SchemaName AND o.name = @SpName;";
                         short maxLen = reader.GetInt16(3);
                         byte prec = reader.GetByte(4);
                         byte scale = reader.GetByte(5);
-                        paramMetaDict[pName] = (typeName, isOutput, maxLen, prec, scale);
+                        bool hasDefault = !reader.IsDBNull(6) && reader.GetBoolean(6);
+                        paramMetaDict[pName] = (typeName, isOutput, maxLen, prec, scale, hasDefault);
                     }
                 }
 
@@ -235,6 +237,28 @@ WHERE s.name = @SchemaName AND o.name = @SpName;";
                 {
                     foreach (var (pName, meta) in paramMetaDict)
                     {
+                        if (!userParams.TryGetValue(pName, out var userVal))
+                        {
+                            if (meta.HasDefaultValue)
+                            {
+                                // User did not supply parameter and it has a default value defined on the SP;
+                                // omit it so SQL Server applies the stored procedure default value.
+                                continue;
+                            }
+
+                            var nullParam = new SqlParameter(pName, MapSqlType(meta.TypeName))
+                            {
+                                Value = DBNull.Value
+                            };
+                            if (meta.IsOutput)
+                            {
+                                nullParam.Direction = ParameterDirection.InputOutput;
+                                if (meta.MaxLength > 0) nullParam.Size = meta.MaxLength;
+                            }
+                            cmd.Parameters.Add(nullParam);
+                            continue;
+                        }
+
                         var sqlParam = new SqlParameter(pName, MapSqlType(meta.TypeName));
                         if (meta.IsOutput)
                         {
@@ -242,15 +266,7 @@ WHERE s.name = @SchemaName AND o.name = @SpName;";
                             if (meta.MaxLength > 0) sqlParam.Size = meta.MaxLength;
                         }
 
-                        if (userParams.TryGetValue(pName, out var userVal))
-                        {
-                            sqlParam.Value = ConvertJsonElementToSqlValue(userVal);
-                        }
-                        else
-                        {
-                            sqlParam.Value = DBNull.Value;
-                        }
-
+                        sqlParam.Value = ConvertJsonElementToSqlValue(userVal);
                         cmd.Parameters.Add(sqlParam);
                     }
                 }
@@ -350,13 +366,13 @@ WHERE s.name = @SchemaName AND o.name = @SpName;";
         }
     }
 
-    private static object ConvertJsonElementToSqlValue(JsonElement elem)
+    internal static object ConvertJsonElementToSqlValue(JsonElement elem)
     {
         return elem.ValueKind switch
         {
             JsonValueKind.Null or JsonValueKind.Undefined => DBNull.Value,
             JsonValueKind.String => elem.GetString() ?? (object)DBNull.Value,
-            JsonValueKind.Number => elem.TryGetInt64(out long l) ? l : elem.GetDouble(),
+            JsonValueKind.Number => elem.TryGetInt64(out long l) ? l : (elem.TryGetDecimal(out decimal d) ? d : elem.GetDouble()),
             JsonValueKind.True => true,
             JsonValueKind.False => false,
             _ => elem.GetRawText()

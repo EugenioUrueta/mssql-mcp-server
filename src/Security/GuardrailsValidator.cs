@@ -15,6 +15,7 @@ namespace MssqlMcpServer.Security;
 public class GuardrailsValidator
 {
     private readonly GlobalSecurity _security;
+    private readonly Regex? _compiledDeniedColumnsRegex;
 
     private static readonly HashSet<string> HazardousKeywords = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -50,6 +51,32 @@ public class GuardrailsValidator
     public GuardrailsValidator(GlobalSecurity security)
     {
         _security = security ?? new GlobalSecurity();
+        _compiledDeniedColumnsRegex = CompileDeniedColumnsRegex(_security.DeniedColumns);
+    }
+
+    private static Regex? CompileDeniedColumnsRegex(IEnumerable<string>? patterns)
+    {
+        if (patterns == null)
+            return null;
+
+        var subPatterns = new List<string>();
+        foreach (var pattern in patterns)
+        {
+            if (string.IsNullOrWhiteSpace(pattern))
+                continue;
+
+            string escaped = Regex.Escape(pattern.Trim())
+                .Replace("\\*", ".*")
+                .Replace("\\?", ".");
+
+            subPatterns.Add("(?:" + escaped + ")");
+        }
+
+        if (subPatterns.Count == 0)
+            return null;
+
+        string unifiedPattern = "^(?:" + string.Join("|", subPatterns) + ")$";
+        return new Regex(unifiedPattern, RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
     }
 
     /// <summary>
@@ -163,11 +190,11 @@ public class GuardrailsValidator
     /// </summary>
     public bool IsColumnDenied(string columnName)
     {
-        if (string.IsNullOrWhiteSpace(columnName))
+        if (string.IsNullOrWhiteSpace(columnName) || _compiledDeniedColumnsRegex == null)
             return false;
 
         string cleanCol = columnName.Trim().Trim('[', ']');
-        return WildcardMatcher.MatchesAny(cleanCol, _security.DeniedColumns);
+        return _compiledDeniedColumnsRegex.IsMatch(cleanCol);
     }
 
     /// <summary>
@@ -230,10 +257,13 @@ public class GuardrailsValidator
         // 3. Check for four-part object identifiers (linked server references)
         if (_security.ProhibitFourPartNames)
         {
-            var fourPartMatch = FourPartNameRegex.Match(strippedSql);
-            if (fourPartMatch.Success)
+            var matches = FourPartNameRegex.Matches(strippedSql);
+            foreach (Match match in matches)
             {
-                return QuerySafetyResult.Unsafe($"Four-part object identifiers (linked server references) like '{fourPartMatch.Value.Trim()}' are strictly prohibited by security guardrails.");
+                if (match.Success && IsLinkedServerReference(strippedSql, match))
+                {
+                    return QuerySafetyResult.Unsafe($"Four-part object identifiers (linked server references) like '{match.Value.Trim()}' are strictly prohibited by security guardrails.");
+                }
             }
         }
 
@@ -246,6 +276,177 @@ public class GuardrailsValidator
         }
 
         return QuerySafetyResult.Safe();
+    }
+
+    private static bool IsLinkedServerReference(string strippedSql, Match match)
+    {
+        // 1. If it contains omitted empty parts ('..' or '...'), it is strictly a linked server reference.
+        // In T-SQL, column references can never have omitted parts (e.g. db..table.col is invalid).
+        if (Regex.IsMatch(match.Value, @"\.\s*\."))
+        {
+            return true;
+        }
+
+        // 2. In T-SQL, 4-part names without omitted parts only refer to linked servers if they appear
+        // in table source contexts (after FROM, JOIN, APPLY, INTO). Otherwise, in SELECT, WHERE, ON,
+        // GROUP BY, ORDER BY, etc., they represent 4-part column references (db.schema.table.col).
+        return IsInTableSourceContext(strippedSql, match.Index);
+    }
+
+    private enum ClauseContext
+    {
+        None,
+        Select,
+        From,
+        Join,
+        Apply,
+        Into,
+        Where,
+        On,
+        GroupBy,
+        OrderBy,
+        Having,
+        Set,
+        Values,
+        With
+    }
+
+    private static bool IsInTableSourceContext(string sql, int targetIndex)
+    {
+        var stack = new Stack<ClauseContext>();
+        stack.Push(ClauseContext.None);
+
+        int len = Math.Min(targetIndex, sql.Length);
+        int i = 0;
+
+        while (i < len)
+        {
+            char c = sql[i];
+
+            if (c == '(')
+            {
+                // When entering parentheses, inherit the active clause context
+                // (e.g. parenthesized table sources like FROM (tbl) or subqueries like FROM (SELECT...))
+                stack.Push(stack.Peek());
+                i++;
+                continue;
+            }
+
+            if (c == ')')
+            {
+                if (stack.Count > 1)
+                {
+                    stack.Pop();
+                }
+                i++;
+                continue;
+            }
+
+            // Skip bracketed identifiers [ID]
+            if (c == '[')
+            {
+                int close = sql.IndexOf(']', i);
+                i = (close >= 0 && close < len) ? close + 1 : len;
+                continue;
+            }
+
+            // Skip quoted identifiers "ID"
+            if (c == '"')
+            {
+                int close = sql.IndexOf('"', i + 1);
+                i = (close >= 0 && close < len) ? close + 1 : len;
+                continue;
+            }
+
+            // Skip string placeholders 'STR'
+            if (c == '\'')
+            {
+                int close = sql.IndexOf('\'', i + 1);
+                i = (close >= 0 && close < len) ? close + 1 : len;
+                continue;
+            }
+
+            // Keyword token
+            if (char.IsLetter(c))
+            {
+                int start = i;
+                while (i < len && (char.IsLetterOrDigit(sql[i]) || sql[i] == '_'))
+                {
+                    i++;
+                }
+                string word = sql.Substring(start, i - start);
+
+                // Check clause keywords (case-insensitive)
+                if (word.Equals("SELECT", StringComparison.OrdinalIgnoreCase))
+                {
+                    ReplaceTop(stack, ClauseContext.Select);
+                }
+                else if (word.Equals("FROM", StringComparison.OrdinalIgnoreCase))
+                {
+                    ReplaceTop(stack, ClauseContext.From);
+                }
+                else if (word.Equals("JOIN", StringComparison.OrdinalIgnoreCase))
+                {
+                    ReplaceTop(stack, ClauseContext.Join);
+                }
+                else if (word.Equals("APPLY", StringComparison.OrdinalIgnoreCase))
+                {
+                    ReplaceTop(stack, ClauseContext.Apply);
+                }
+                else if (word.Equals("INTO", StringComparison.OrdinalIgnoreCase))
+                {
+                    ReplaceTop(stack, ClauseContext.Into);
+                }
+                else if (word.Equals("WHERE", StringComparison.OrdinalIgnoreCase))
+                {
+                    ReplaceTop(stack, ClauseContext.Where);
+                }
+                else if (word.Equals("ON", StringComparison.OrdinalIgnoreCase))
+                {
+                    ReplaceTop(stack, ClauseContext.On);
+                }
+                else if (word.Equals("HAVING", StringComparison.OrdinalIgnoreCase))
+                {
+                    ReplaceTop(stack, ClauseContext.Having);
+                }
+                else if (word.Equals("GROUP", StringComparison.OrdinalIgnoreCase))
+                {
+                    ReplaceTop(stack, ClauseContext.GroupBy);
+                }
+                else if (word.Equals("ORDER", StringComparison.OrdinalIgnoreCase))
+                {
+                    ReplaceTop(stack, ClauseContext.OrderBy);
+                }
+                else if (word.Equals("SET", StringComparison.OrdinalIgnoreCase))
+                {
+                    ReplaceTop(stack, ClauseContext.Set);
+                }
+                else if (word.Equals("VALUES", StringComparison.OrdinalIgnoreCase))
+                {
+                    ReplaceTop(stack, ClauseContext.Values);
+                }
+                else if (word.Equals("WITH", StringComparison.OrdinalIgnoreCase))
+                {
+                    ReplaceTop(stack, ClauseContext.With);
+                }
+                continue;
+            }
+
+            i++;
+        }
+
+        ClauseContext current = stack.Peek();
+        return current == ClauseContext.From ||
+               current == ClauseContext.Join ||
+               current == ClauseContext.Apply ||
+               current == ClauseContext.Into;
+    }
+
+    private static void ReplaceTop(Stack<ClauseContext> stack, ClauseContext newContext)
+    {
+        if (stack.Count > 0)
+            stack.Pop();
+        stack.Push(newContext);
     }
 
     /// <summary>

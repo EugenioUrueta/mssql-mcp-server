@@ -335,7 +335,7 @@ ORDER BY s.name, o.name;";
                     long? rowCount = null;
                     if (includeRowCount && typeVal == "TABLE" && !reader.IsDBNull(5))
                     {
-                        rowCount = reader.GetInt64(5);
+                        rowCount = Convert.ToInt64(reader.GetValue(5));
                     }
 
                     // If it's a table, verify it's not restricted by DeniedTables

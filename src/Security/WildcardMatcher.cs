@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Text.RegularExpressions;
 
@@ -9,6 +10,8 @@ namespace MssqlMcpServer.Security;
 /// </summary>
 public static class WildcardMatcher
 {
+    private static readonly ConcurrentDictionary<string, Regex> PatternCache = new(StringComparer.OrdinalIgnoreCase);
+
     /// <summary>
     /// Checks if the input matches the specified wildcard pattern.
     /// </summary>
@@ -23,11 +26,16 @@ public static class WildcardMatcher
         if (pattern == "*")
             return true;
 
-        string regexPattern = "^" + Regex.Escape(pattern)
-            .Replace("\\*", ".*")
-            .Replace("\\?", ".") + "$";
+        var regex = PatternCache.GetOrAdd(pattern, p =>
+        {
+            string regexPattern = "^" + Regex.Escape(p)
+                .Replace("\\*", ".*")
+                .Replace("\\?", ".") + "$";
 
-        return Regex.IsMatch(input, regexPattern, RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+            return new Regex(regexPattern, RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        });
+
+        return regex.IsMatch(input);
     }
 
     /// <summary>
