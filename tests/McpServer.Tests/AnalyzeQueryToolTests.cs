@@ -110,6 +110,19 @@ public class AnalyzeQueryToolTests
     }
 
     [Fact]
+    public async Task AnalyzeQueryTool_RejectsFourPartNamesAfterTableHints()
+    {
+        var tool = new AnalyzeQueryTool(_connectionManager, _validator);
+
+        using var doc = JsonDocument.Parse("""{"query": "SELECT u.user_id FROM orders o WITH (NOLOCK), remote_srv.app_db.dbo.users u"}""");
+        var result = await tool.ExecuteAsync(doc.RootElement);
+
+        Assert.True(result.IsError);
+        Assert.Contains("rejected by guardrails", result.Content[0].Text, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("Four-part object identifiers", result.Content[0].Text, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public void ParseShowPlanXml_ParsesEstimatedSubtreeCost_AndExpensiveOperations()
     {
         string planXml = """

@@ -480,10 +480,35 @@ public class GuardrailsValidatorTests
     [InlineData("SELECT * FROM orders HAVING COUNT(app_db.dbo.orders.order_id) > 1")]
     [InlineData("SELECT (SELECT app_db.dbo.orders.order_id FROM orders) FROM audit_logs")]
     [InlineData("WITH CTE AS (SELECT app_db.dbo.orders.order_id FROM orders) SELECT * FROM CTE")]
-    public void ValidateReadQuery_ShouldAllow_FourPartQualifiedColumnsInNonTableContexts(string sql)
+    public void ValidateReadQuery_ShouldReject_FourPartColumnReferences(string sql)
     {
         var result = _validator.ValidateReadQuery(sql);
-        Assert.True(result.IsSafe, $"Query '{sql}' should have been allowed as 4-part qualified column, but got error: {result.ErrorMessage}");
+        Assert.False(result.IsSafe, $"Query '{sql}' should have been rejected for four-part identifiers.");
+        Assert.Contains("Four-part object identifiers", result.ErrorMessage, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData("SELECT u.user_id FROM orders o WITH (NOLOCK), remote_srv.app_db.dbo.users u")]
+    [InlineData("SELECT u.user_id FROM orders o WITH (INDEX(1)), remote_srv.app_db.dbo.users u")]
+    [InlineData("SELECT u.user_id FROM orders o JOIN customers c ON 1 = 1, remote_srv.app_db.dbo.users u")]
+    [InlineData("SELECT u.user_id FROM orders o LEFT JOIN customers c ON o.customer_id = c.customer_id, remote_srv.app_db.dbo.users u")]
+    [InlineData("SELECT u.user_id FROM orders o WITH (NOLOCK) CROSS JOIN [remote_srv].[app_db].[dbo].[users] u")]
+    [InlineData("WITH cte AS (SELECT o.order_id FROM orders o WITH (NOLOCK), remote_srv.app_db.dbo.users u) SELECT * FROM cte")]
+    public void ValidateReadQuery_ShouldReject_FourPartNamesAfterTableHintsOrJoinConditions(string sql)
+    {
+        var result = _validator.ValidateReadQuery(sql);
+        Assert.False(result.IsSafe, $"Query '{sql}' should have been rejected for four-part identifiers.");
+        Assert.Contains("Four-part object identifiers", result.ErrorMessage, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData("SELECT o.order_id FROM app_db.dbo.orders AS o WITH (NOLOCK)")]
+    [InlineData("SELECT o.order_id, c.name FROM orders o JOIN customers c ON o.customer_id = c.customer_id")]
+    [InlineData("SELECT o.order_id FROM app_db.dbo.orders o WHERE o.total > 5 ORDER BY o.created_at")]
+    public void ValidateReadQuery_ShouldAllow_TwoAndThreePartNames(string sql)
+    {
+        var result = _validator.ValidateReadQuery(sql);
+        Assert.True(result.IsSafe, $"Query '{sql}' was unexpectedly rejected: {result.ErrorMessage}");
     }
 
     [Theory]
