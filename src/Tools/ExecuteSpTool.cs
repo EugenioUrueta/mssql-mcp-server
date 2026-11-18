@@ -23,8 +23,7 @@ SELECT
     p.is_output,
     p.max_length,
     p.precision,
-    p.scale,
-    p.has_default_value
+    p.scale
 FROM sys.parameters p
 INNER JOIN sys.objects o ON p.object_id = o.object_id
 INNER JOIN sys.schemas s ON o.schema_id = s.schema_id
@@ -183,7 +182,7 @@ WHERE s.name = @SchemaName AND o.name = @SpName;";
             try
             {
                 // Query parameter metadata from sys.parameters
-                var paramMetaDict = new Dictionary<string, (string TypeName, bool IsOutput, int MaxLength, byte Precision, byte Scale, bool HasDefaultValue)>(StringComparer.OrdinalIgnoreCase);
+                var paramMetaDict = new Dictionary<string, (string TypeName, bool IsOutput, int MaxLength, byte Precision, byte Scale)>(StringComparer.OrdinalIgnoreCase);
 
                 await using (var cmdMeta = new SqlCommand(ParamMetaSql, connection, transaction))
                 {
@@ -199,8 +198,7 @@ WHERE s.name = @SchemaName AND o.name = @SpName;";
                         short maxLen = reader.GetInt16(3);
                         byte prec = reader.GetByte(4);
                         byte scale = reader.GetByte(5);
-                        bool hasDefault = !reader.IsDBNull(6) && reader.GetBoolean(6);
-                        paramMetaDict[pName] = (typeName, isOutput, maxLen, prec, scale, hasDefault);
+                        paramMetaDict[pName] = (typeName, isOutput, maxLen, prec, scale);
                     }
                 }
 
@@ -235,39 +233,10 @@ WHERE s.name = @SchemaName AND o.name = @SpName;";
                 // If parameter metadata exists, build typed parameters
                 if (paramMetaDict.Count > 0)
                 {
-                    foreach (var (pName, meta) in paramMetaDict)
+                    var builtParams = BuildParameters(paramMetaDict, userParams);
+                    foreach (var p in builtParams)
                     {
-                        if (!userParams.TryGetValue(pName, out var userVal))
-                        {
-                            if (meta.HasDefaultValue)
-                            {
-                                // User did not supply parameter and it has a default value defined on the SP;
-                                // omit it so SQL Server applies the stored procedure default value.
-                                continue;
-                            }
-
-                            var nullParam = new SqlParameter(pName, MapSqlType(meta.TypeName))
-                            {
-                                Value = DBNull.Value
-                            };
-                            if (meta.IsOutput)
-                            {
-                                nullParam.Direction = ParameterDirection.InputOutput;
-                                if (meta.MaxLength > 0) nullParam.Size = meta.MaxLength;
-                            }
-                            cmd.Parameters.Add(nullParam);
-                            continue;
-                        }
-
-                        var sqlParam = new SqlParameter(pName, MapSqlType(meta.TypeName));
-                        if (meta.IsOutput)
-                        {
-                            sqlParam.Direction = ParameterDirection.InputOutput;
-                            if (meta.MaxLength > 0) sqlParam.Size = meta.MaxLength;
-                        }
-
-                        sqlParam.Value = ConvertJsonElementToSqlValue(userVal);
-                        cmd.Parameters.Add(sqlParam);
+                        cmd.Parameters.Add(p);
                     }
                 }
                 else
@@ -364,6 +333,36 @@ WHERE s.name = @SchemaName AND o.name = @SpName;";
         {
             return McpToolCallResult.Error($"Error executing stored procedure: {ex.Message}");
         }
+    }
+
+    internal static List<SqlParameter> BuildParameters(
+        IReadOnlyDictionary<string, (string TypeName, bool IsOutput, int MaxLength, byte Precision, byte Scale)> paramMeta,
+        IReadOnlyDictionary<string, JsonElement> userParams)
+    {
+        var result = new List<SqlParameter>();
+        foreach (var (pName, meta) in paramMeta)
+        {
+            bool supplied = userParams.TryGetValue(pName, out var userVal);
+
+            // Not supplied input parameter: omit it so SQL Server applies the procedure default
+            // (sys.parameters.has_default_value is only populated for CLR objects, never for T-SQL).
+            if (!supplied && !meta.IsOutput)
+                continue;
+
+            var sqlParam = new SqlParameter(pName, MapSqlType(meta.TypeName))
+            {
+                Value = supplied ? ConvertJsonElementToSqlValue(userVal) : DBNull.Value
+            };
+
+            if (meta.IsOutput)
+            {
+                sqlParam.Direction = ParameterDirection.InputOutput;
+                if (meta.MaxLength > 0) sqlParam.Size = meta.MaxLength;
+            }
+
+            result.Add(sqlParam);
+        }
+        return result;
     }
 
     internal static object ConvertJsonElementToSqlValue(JsonElement elem)

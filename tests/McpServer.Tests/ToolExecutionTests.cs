@@ -1,8 +1,10 @@
 using System;
 using System.Collections.Generic;
+using System.Data;
 using System.Reflection;
 using System.Text.Json;
 using System.Threading.Tasks;
+using Microsoft.Data.SqlClient;
 using MssqlMcpServer.Configuration;
 using MssqlMcpServer.Context;
 using MssqlMcpServer.Security;
@@ -1364,10 +1366,109 @@ public class ToolExecutionTests
     }
 
     [Fact]
-    public void ExecuteSpTool_ParamMetaSql_QueriesHasDefaultValue()
+    public void ExecuteSpTool_BuildParameters_OmitsUnsuppliedInputParameter()
     {
-        Assert.Contains("p.has_default_value", ExecuteSpTool.ParamMetaSql, StringComparison.OrdinalIgnoreCase);
-        Assert.Contains("sys.parameters", ExecuteSpTool.ParamMetaSql, StringComparison.OrdinalIgnoreCase);
+        var paramMeta = new Dictionary<string, (string TypeName, bool IsOutput, int MaxLength, byte Precision, byte Scale)>
+        {
+            ["@CustomerId"] = ("int", false, 4, 10, 0),
+            ["@Status"] = ("nvarchar", false, 50, 0, 0)
+        };
+
+        using var doc = JsonDocument.Parse("""{"@CustomerId": 100}""");
+        var userParams = new Dictionary<string, JsonElement>
+        {
+            ["@CustomerId"] = doc.RootElement.GetProperty("@CustomerId")
+        };
+
+        var result = ExecuteSpTool.BuildParameters(paramMeta, userParams);
+
+        Assert.Single(result);
+        Assert.Equal("@CustomerId", result[0].ParameterName);
+        Assert.DoesNotContain(result, p => p.ParameterName == "@Status");
+    }
+
+    [Fact]
+    public void ExecuteSpTool_BuildParameters_IncludesSuppliedInputParameter()
+    {
+        var paramMeta = new Dictionary<string, (string TypeName, bool IsOutput, int MaxLength, byte Precision, byte Scale)>
+        {
+            ["@OrderId"] = ("int", false, 4, 10, 0)
+        };
+
+        using var doc = JsonDocument.Parse("""{"@OrderId": 555}""");
+        var userParams = new Dictionary<string, JsonElement>
+        {
+            ["@OrderId"] = doc.RootElement.GetProperty("@OrderId")
+        };
+
+        var result = ExecuteSpTool.BuildParameters(paramMeta, userParams);
+
+        Assert.Single(result);
+        Assert.Equal("@OrderId", result[0].ParameterName);
+        Assert.Equal(555L, result[0].Value);
+        Assert.Equal(SqlDbType.Int, result[0].SqlDbType);
+    }
+
+    [Fact]
+    public void ExecuteSpTool_BuildParameters_ExplicitNullInputParameter_PreservesDBNull()
+    {
+        var paramMeta = new Dictionary<string, (string TypeName, bool IsOutput, int MaxLength, byte Precision, byte Scale)>
+        {
+            ["@Notes"] = ("nvarchar", false, 200, 0, 0)
+        };
+
+        using var doc = JsonDocument.Parse("""{"@Notes": null}""");
+        var userParams = new Dictionary<string, JsonElement>
+        {
+            ["@Notes"] = doc.RootElement.GetProperty("@Notes")
+        };
+
+        var result = ExecuteSpTool.BuildParameters(paramMeta, userParams);
+
+        Assert.Single(result);
+        Assert.Equal("@Notes", result[0].ParameterName);
+        Assert.Equal(DBNull.Value, result[0].Value);
+    }
+
+    [Fact]
+    public void ExecuteSpTool_BuildParameters_UnsuppliedOutputParameter_SetsDBNullAndInputOutput()
+    {
+        var paramMeta = new Dictionary<string, (string TypeName, bool IsOutput, int MaxLength, byte Precision, byte Scale)>
+        {
+            ["@TotalCount"] = ("int", true, 4, 10, 0)
+        };
+
+        var userParams = new Dictionary<string, JsonElement>();
+
+        var result = ExecuteSpTool.BuildParameters(paramMeta, userParams);
+
+        Assert.Single(result);
+        Assert.Equal("@TotalCount", result[0].ParameterName);
+        Assert.Equal(DBNull.Value, result[0].Value);
+        Assert.Equal(ParameterDirection.InputOutput, result[0].Direction);
+        Assert.Equal(4, result[0].Size);
+    }
+
+    [Fact]
+    public void ExecuteSpTool_BuildParameters_PreservesDecimalPrecision()
+    {
+        var paramMeta = new Dictionary<string, (string TypeName, bool IsOutput, int MaxLength, byte Precision, byte Scale)>
+        {
+            ["@Rate"] = ("decimal", false, 9, 18, 4)
+        };
+
+        using var doc = JsonDocument.Parse("""{"@Rate": 12.345}""");
+        var userParams = new Dictionary<string, JsonElement>
+        {
+            ["@Rate"] = doc.RootElement.GetProperty("@Rate")
+        };
+
+        var result = ExecuteSpTool.BuildParameters(paramMeta, userParams);
+
+        Assert.Single(result);
+        Assert.Equal("@Rate", result[0].ParameterName);
+        Assert.IsType<decimal>(result[0].Value);
+        Assert.Equal(12.345m, (decimal)result[0].Value);
     }
 
     [Theory]
